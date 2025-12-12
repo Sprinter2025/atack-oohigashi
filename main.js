@@ -5,9 +5,10 @@
 // - Particles: pre-rendered sprite + MAX_PARTICLES cap (fast)
 // - Floaters/Particles: in-place compaction (NO Array.filter allocations)
 // - Sounds: WebAudio (AudioBuffer) + throttle (fix tap-stutter)
-// - Colors: revert to dark background scheme (like old black BG)
-// - Mobile: character speed x0.5
-// - Shadow: slightly whitish
+// - IMPORTANT: WAIT for audio decode BEFORE starting the game (prevents mid-reset)
+// - Colors: dark background scheme (like old black BG)
+// - Mobile: character speed tuned (0.625 of PC)
+// - Shadow: more whitish
 
 const canvas = document.getElementById("game");
 const ctx = canvas.getContext("2d", { alpha: false });
@@ -86,33 +87,56 @@ let gainSe = null;
 let buffers = { hit01: null, hit02: null, count: null, bgm: null };
 let bgmSource = null;
 
-async function ensureAudio() {
-  if (audioCtx) return;
-  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+// ★追加：ロード多重実行防止 & START中ガード
+let audioReadyPromise = null;
+let isStarting = false;
 
-  gainBgm = audioCtx.createGain();
-  gainSe = audioCtx.createGain();
-  gainBgm.gain.value = 0.18; // bgm volume
-  gainSe.gain.value = 0.85;  // se volume
-  gainBgm.connect(audioCtx.destination);
-  gainSe.connect(audioCtx.destination);
-
-  async function loadBuf(url) {
-    const res = await fetch(url);
-    const arr = await res.arrayBuffer();
-    return await audioCtx.decodeAudioData(arr);
+function setButtonLoading(on) {
+  if (on) {
+    btn.disabled = true;
+    btn.textContent = "LOADING...";
+    resultEl.textContent = "音声を読み込み中…";
+  } else {
+    btn.disabled = false;
   }
+}
 
-  const [b1, b2, b3, b4] = await Promise.all([
-    loadBuf("./assets/hit01.mp3"),
-    loadBuf("./assets/hit02.mp3"),
-    loadBuf("./assets/count.mp3"),
-    loadBuf("./assets/bgm.mp3"),
-  ]);
-  buffers.hit01 = b1;
-  buffers.hit02 = b2;
-  buffers.count = b3;
-  buffers.bgm  = b4;
+async function ensureAudio() {
+  // ★同時に複数回走らないようにする
+  if (audioReadyPromise) return audioReadyPromise;
+  if (audioCtx) return;
+
+  audioReadyPromise = (async () => {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+    gainBgm = audioCtx.createGain();
+    gainSe = audioCtx.createGain();
+    gainBgm.gain.value = 0.18; // bgm volume
+    gainSe.gain.value = 0.85;  // se volume
+    gainBgm.connect(audioCtx.destination);
+    gainSe.connect(audioCtx.destination);
+
+    async function loadBuf(url) {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`fetch failed ${res.status}: ${url}`);
+      const arr = await res.arrayBuffer();
+      return await audioCtx.decodeAudioData(arr);
+    }
+
+    const [b1, b2, b3, b4] = await Promise.all([
+      loadBuf("./assets/hit01.mp3"),
+      loadBuf("./assets/hit02.mp3"),
+      loadBuf("./assets/count.mp3"),
+      loadBuf("./assets/bgm.mp3"),
+    ]);
+
+    buffers.hit01 = b1;
+    buffers.hit02 = b2;
+    buffers.count = b3;
+    buffers.bgm = b4;
+  })();
+
+  return audioReadyPromise;
 }
 
 function startBGM() {
@@ -163,7 +187,8 @@ function speedLimit() {
   const { w, h } = getViewportSize();
   const s = Math.min(w, h);
   const base = clamp(s * 0.85, 520, 900);
-  return IS_MOBILE ? base * 0.5 : base; // ★スマホは0.5倍
+  // ★スマホは 0.625 (= 0.5 * 1.25) に調整
+  return IS_MOBILE ? base * 0.625 : base;
 }
 
 const state = {
@@ -282,8 +307,8 @@ function resetGameForIntro(introSeconds) {
   state.face.x = rand(state.face.r, w - state.face.r);
   state.face.y = rand(state.face.r + 90, h - state.face.r);
 
-  // ★スマホは動き0.5倍
-  const spMul = IS_MOBILE ? 0.5 : 1.0;
+  // ★スマホは動き 0.625 に調整
+  const spMul = IS_MOBILE ? 0.625 : 1.0;
 
   const baseVx = rand(220, 340) * spMul * (Math.random() < 0.5 ? -1 : 1);
   const baseVy = rand(180, 300) * spMul * (Math.random() < 0.5 ? -1 : 1);
@@ -346,30 +371,47 @@ function endGame() {
   btn.textContent = "RETRY";
 }
 
+// ★修正：音声ロード(decode)完了までゲーム開始しない + 二重起動防止 + LOADING表示
 async function startGame() {
-  await ensureAudio();
-  if (audioCtx.state === "suspended") {
-    try { await audioCtx.resume(); } catch (_) {}
+  if (isStarting) return;
+  isStarting = true;
+  setButtonLoading(true);
+
+  try {
+    await ensureAudio();
+    if (audioCtx && audioCtx.state === "suspended") {
+      try { await audioCtx.resume(); } catch (_) {}
+    }
+    startBGM();
+
+    const introSeconds = hasStartedOnce ? INTRO_RETRY_SECONDS : INTRO_FIRST_SECONDS;
+    resetGameForIntro(introSeconds);
+
+    state.running = true;
+    overlay.classList.add("hidden");
+    state.lastT = performance.now();
+
+    addFloater("GET READY...", state.face.x, state.face.y - state.face.r - 10, {
+      size: IS_MOBILE ? 30 : 34,
+      life: 1.0,
+      rise: 50,
+      wobble: 8,
+      weight: 900
+    });
+
+    hasStartedOnce = true;
+    requestAnimationFrame(loop);
+
+  } catch (e) {
+    console.error(e);
+    overlay.classList.remove("hidden");
+    titleEl.textContent = "AUDIO ERROR";
+    resultEl.textContent = "音声の読み込みに失敗（assetsパス/サーバ起動を確認）";
+    btn.textContent = "RETRY";
+  } finally {
+    setButtonLoading(false);
+    isStarting = false;
   }
-  startBGM();
-
-  const introSeconds = hasStartedOnce ? INTRO_RETRY_SECONDS : INTRO_FIRST_SECONDS;
-  resetGameForIntro(introSeconds);
-
-  state.running = true;
-  overlay.classList.add("hidden");
-  state.lastT = performance.now();
-
-  addFloater("GET READY...", state.face.x, state.face.y - state.face.r - 10, {
-    size: IS_MOBILE ? 30 : 34,
-    life: 1.0,
-    rise: 50,
-    wobble: 8,
-    weight: 900
-  });
-
-  hasStartedOnce = true;
-  requestAnimationFrame(loop);
 }
 
 btn.addEventListener("click", startGame);
@@ -597,7 +639,7 @@ function drawIntroCountdown() {
 }
 
 // ---- draw ----
-const BG_COLOR = "#0b0f1a";            // ★黒背景に戻す
+const BG_COLOR = "#0b0f1a";
 const HUD_COLOR = "rgba(255,255,255,0.96)";
 
 function draw() {
@@ -630,7 +672,7 @@ function draw() {
     ctx.globalAlpha = 1;
   }
 
-  // floaters (white like old scheme)
+  // floaters
   for (let i = 0; i < state.floaters.length; i++) {
     const ft = state.floaters[i];
     const p = ft.t / ft.life;
@@ -644,7 +686,6 @@ function draw() {
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
 
-    // cheap shadow
     ctx.fillStyle = "rgba(0,0,0,0.55)";
     ctx.fillText(ft.text, xx + 2, yy + 2);
 
@@ -660,11 +701,11 @@ function draw() {
   const pop = (f.scalePop > 0) ? (1 + 0.18 * (f.scalePop / 0.20)) : 1;
   const size = (f.r * 2) * pop;
 
-  // ---- shadow: slightly whitish ----
-  ctx.globalAlpha = 0.26;
+  // ---- shadow: more whitish ----
+  ctx.globalAlpha = 0.32;
   ctx.beginPath();
   ctx.ellipse(f.x, f.y + f.r * 0.78, f.r * 0.95, f.r * 0.35, 0, 0, Math.PI * 2);
-  ctx.fillStyle = "rgba(255,255,255,0.22)"; // ★ちょっと白寄り
+  ctx.fillStyle = "rgba(255,255,255,0.35)";
   ctx.fill();
   ctx.globalAlpha = 1;
 
@@ -687,7 +728,7 @@ function draw() {
 
   ctx.restore();
 
-  // HUD (right top, white like old scheme)
+  // HUD
   ctx.save();
   ctx.globalAlpha = 0.95;
   ctx.textAlign = "right";
