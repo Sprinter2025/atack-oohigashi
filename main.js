@@ -77,6 +77,85 @@ function makeDotSprite() {
 }
 makeDotSprite();
 
+// ---- Rainbow fallback for mobile (when ctx.filter doesn't work) ----
+const HAS_CTX_FILTER = ("filter" in ctx);
+const RAINBOW_STEP_DEG = 12; // 粗く刻んでキャッシュ（軽量化）
+
+const rainbowCache = new Map(); // key -> canvas
+
+function rgbToHsl(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r,g,b), min = Math.min(r,g,b);
+  let h = 0, s = 0;
+  const l = (max + min) / 2;
+  const d = max - min;
+  if (d !== 0) {
+    s = d / (1 - Math.abs(2*l - 1));
+    switch (max) {
+      case r: h = ((g - b) / d) % 6; break;
+      case g: h = (b - r) / d + 2; break;
+      case b: h = (r - g) / d + 4; break;
+    }
+    h *= 60;
+    if (h < 0) h += 360;
+  }
+  return [h, s, l];
+}
+
+function hslToRgb(h, s, l) {
+  const c = (1 - Math.abs(2*l - 1)) * s;
+  const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+  const m = l - c/2;
+  let r1=0,g1=0,b1=0;
+  if (0<=h && h<60) [r1,g1,b1]=[c,x,0];
+  else if (60<=h && h<120) [r1,g1,b1]=[x,c,0];
+  else if (120<=h && h<180) [r1,g1,b1]=[0,c,x];
+  else if (180<=h && h<240) [r1,g1,b1]=[0,x,c];
+  else if (240<=h && h<300) [r1,g1,b1]=[x,0,c];
+  else [r1,g1,b1]=[c,0,x];
+  return [
+    Math.round((r1+m)*255),
+    Math.round((g1+m)*255),
+    Math.round((b1+m)*255)
+  ];
+}
+
+function getRainbowCanvas(img, hueDeg, sizePx) {
+  if (!img || !img.complete || sizePx <= 0) return null;
+
+  const qHue = (Math.floor(hueDeg / RAINBOW_STEP_DEG) * RAINBOW_STEP_DEG) % 360;
+  const key = `${img.src}|${qHue}|${sizePx}`;
+  const cached = rainbowCache.get(key);
+  if (cached) return cached;
+
+  // 作成
+  const c = document.createElement("canvas");
+  c.width = sizePx;
+  c.height = sizePx;
+  const g = c.getContext("2d", { willReadFrequently: true });
+
+  g.clearRect(0, 0, sizePx, sizePx);
+  g.drawImage(img, 0, 0, sizePx, sizePx);
+
+  const im = g.getImageData(0, 0, sizePx, sizePx);
+  const d = im.data;
+  for (let i = 0; i < d.length; i += 4) {
+    const a = d[i+3];
+    if (a === 0) continue;
+    const [h, s, l] = rgbToHsl(d[i], d[i+1], d[i+2]);
+    const nh = (h + qHue) % 360;
+    const [rr, gg, bb] = hslToRgb(nh, s, l);
+    d[i] = rr; d[i+1] = gg; d[i+2] = bb;
+  }
+  g.putImageData(im, 0, 0);
+
+  // キャッシュ肥大防止（適当な上限）
+  if (rainbowCache.size > 80) rainbowCache.clear();
+  rainbowCache.set(key, c);
+  return c;
+}
+
+
 // ---- image assets ----
 const assets = {
   face: new Image(),
@@ -210,6 +289,49 @@ function pickResultPack(score) {
   return packs[packs.length - 1] || null;
 }
 
+const resultImgCache = new Map(); // url -> Image
+
+async function preloadResultImages() {
+  const packs = window.RESULT_PACKS;
+  if (!Array.isArray(packs)) return;
+
+  const urls = new Set();
+  for (const p of packs) if (p && p.img) urls.add(p.img);
+
+  const tasks = [];
+  urls.forEach((url) => {
+    if (resultImgCache.has(url)) return;
+    const im = new Image();
+    im.src = url;
+    resultImgCache.set(url, im);
+
+    // decodeできる環境は先にdecodeしておく
+    if (im.decode) {
+      tasks.push(im.decode().catch(() => {}));
+    } else {
+      tasks.push(new Promise((r) => {
+        im.onload = () => r();
+        im.onerror = () => r();
+      }));
+    }
+  });
+
+  await Promise.all(tasks);
+}
+
+// RESULT_PACKS が読み込まれてから実行（script順が不明でも安全）
+(function waitAndPreload() {
+  let tries = 0;
+  const timer = setInterval(() => {
+    tries++;
+    if (Array.isArray(window.RESULT_PACKS) || tries > 50) {
+      clearInterval(timer);
+      preloadResultImages().catch(() => {});
+    }
+  }, 100);
+})();
+
+
 function pickRandom(arr) {
   if (!Array.isArray(arr) || arr.length === 0) return "";
   return arr[(Math.random() * arr.length) | 0];
@@ -226,16 +348,36 @@ function renderResultWithPack(score) {
   wrap.style.gap = "10px";
   wrap.style.justifyItems = "center";
 
+  // ★画像があるときは、画像が来るまで文字だけ出さない（違和感防止）
+  const needsImg = !!(pack && pack.img);
+  if (needsImg) wrap.style.visibility = "hidden";
+
   if (pack && pack.img) {
     const img = document.createElement("img");
-    img.src = pack.img;
+
+    // ★キャッシュがあればそれを優先（ロード済みの可能性が高い）
+    const cached = resultImgCache.get(pack.img);
+    img.src = cached ? cached.src : pack.img;
+
     img.alt = "result";
     img.style.width = "min(72vw, 360px)";
     img.style.height = "auto";
     img.style.borderRadius = "14px";
     img.style.boxShadow = "0 10px 30px rgba(0,0,0,0.35)";
     img.loading = "eager";
+    img.decoding = "sync";
+
+    const show = () => { wrap.style.visibility = "visible"; };
+    if (img.complete) show();
+    else {
+      img.addEventListener("load", show, { once: true });
+      img.addEventListener("error", show, { once: true });
+    }
+
     wrap.appendChild(img);
+  } else {
+    // 画像が無いパックならすぐ表示
+    wrap.style.visibility = "visible";
   }
 
   const comment = document.createElement("div");
@@ -842,16 +984,27 @@ function draw() {
   ctx.arc(f.x, f.y, (f.r * pop), 0, Math.PI * 2);
   ctx.clip();
 
-  if (hueStrength > 0) {
-    // 強さは "saturate/contrast" で調整（軽い）
+  const useRainbow = (hueStrength > 0);
+
+  if (useRainbow && HAS_CTX_FILTER) {
     const sat = state.fever ? 2.2 : 1.2;
     const con = state.fever ? 1.12 : 1.02;
     ctx.filter = `hue-rotate(${hueDeg}deg) saturate(${sat}) contrast(${con})`;
-  } else {
+    ctx.drawImage(img, f.x - size / 2, f.y - size / 2, size, size);
     ctx.filter = "none";
+  } else if (useRainbow && !HAS_CTX_FILTER) {
+    // iOS等でfilterが効かない場合：敵だけ色相回転したcanvasを使う（キャッシュ）
+    const sp = Math.max(32, (size | 0));
+    const rc = getRainbowCanvas(img, hueDeg, sp);
+    if (rc) {
+      ctx.drawImage(rc, f.x - size / 2, f.y - size / 2, size, size);
+    } else {
+      ctx.drawImage(img, f.x - size / 2, f.y - size / 2, size, size);
+    }
+  } else {
+    ctx.drawImage(img, f.x - size / 2, f.y - size / 2, size, size);
   }
 
-  ctx.drawImage(img, f.x - size / 2, f.y - size / 2, size, size);
 
   ctx.filter = "none";
   ctx.restore();
