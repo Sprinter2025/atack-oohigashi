@@ -1,11 +1,8 @@
-// main.js (FULL COPY-PASTE)
-// - First start: 7s intro freeze
-// - Retry: 3s intro freeze
-// - Big center countdown on screen during intro
-// - Sounds:
-//   - Normal hit:  hit01.mp3
-//   - Bonus hit:   hit02.mp3 (5 combo bonus, fever start)
-//   - Countdown:   count.mp3 (play once when introLeft <= 3.0)
+// main.js (FULL COPY-PASTE)  --- Mobile lightweight ver ---
+// - iOS Safari bottom bar safe: use visualViewport for sizing
+// - Tap hitbox bigger on mobile
+// - Performance: cap DPR to 2, reduce particles/floaters, thinner strokes on mobile
+// - Sounds: throttle SE on mobile (avoid audio spam stutter)
 
 const canvas = document.getElementById("game");
 const ctx = canvas.getContext("2d");
@@ -23,16 +20,27 @@ const BEST_KEY = "facebop_best_v4";
 function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
 function rand(a, b) { return a + Math.random() * (b - a); }
 
+// ---- Mobile detect & viewport size ----
+const IS_MOBILE = matchMedia("(pointer: coarse)").matches;
+
+function getViewportSize() {
+  const vv = window.visualViewport;
+  const w = vv ? vv.width : window.innerWidth;
+  const h = vv ? vv.height : window.innerHeight;
+  return { w, h };
+}
+
 function fitCanvas() {
-  const dpr = Math.max(1, Math.floor(window.devicePixelRatio || 1));
-  const w = Math.floor(window.innerWidth * dpr);
-  const h = Math.floor(window.innerHeight * dpr);
-  canvas.width = w;
-  canvas.height = h;
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.scale(dpr, dpr);
+  const { w, h } = getViewportSize();
+  const dpr = Math.min(2, Math.max(1, window.devicePixelRatio || 1)); // cap for performance
+  canvas.style.width = w + "px";
+  canvas.style.height = h + "px";
+  canvas.width = Math.floor(w * dpr);
+  canvas.height = Math.floor(h * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 }
 window.addEventListener("resize", fitCanvas);
+window.visualViewport?.addEventListener("resize", fitCanvas);
 fitCanvas();
 
 const assets = {
@@ -67,8 +75,15 @@ function initAudio() {
   if (!assets.count) assets.count = safeAudio("./assets/count.mp3", false, 0.75);
 }
 
+// ---- audio throttle (mobile) ----
+let lastSeTime = 0;
 function playAudio(a) {
   if (!a) return;
+
+  const now = performance.now();
+  if (IS_MOBILE && now - lastSeTime < 80) return; // drop too-frequent SE
+  lastSeTime = now;
+
   a.currentTime = 0;
   a.play().catch(() => {});
 }
@@ -96,7 +111,8 @@ const GAME_SECONDS = 30.0;
 
 // 速度の上限（暴走防止）
 function speedLimit() {
-  const s = Math.min(window.innerWidth, window.innerHeight);
+  const { w, h } = getViewportSize();
+  const s = Math.min(w, h);
   return clamp(s * 0.85, 520, 900); // px/s
 }
 
@@ -146,13 +162,17 @@ const state = {
 let hasStartedOnce = false; // ★初回/リトライ判定
 
 function addFloater(text, x, y, opts = {}) {
+  // mobile: shorter & fewer
   const {
     size = 26,
-    life = 0.7,
-    rise = 140,
-    wobble = 10,
+    life = IS_MOBILE ? 0.55 : 0.7,
+    rise = IS_MOBILE ? 110 : 140,
+    wobble = IS_MOBILE ? 8 : 10,
     weight = 1000,
   } = opts;
+
+  // mobile: keep floater count bounded
+  if (IS_MOBILE && state.floaters.length > 18) return;
 
   state.floaters.push({
     text,
@@ -176,14 +196,14 @@ function startFever(seconds = 7.0) {
   playHitBonus();
 
   addFloater("FEVER x2!!", state.face.x, state.face.y - state.face.r - 12, {
-    size: 40,
+    size: IS_MOBILE ? 34 : 40,
     life: 1.0,
-    rise: 90,
+    rise: IS_MOBILE ? 70 : 90,
     wobble: 20,
     weight: 1200
   });
 
-  state.shake = Math.max(state.shake, 0.28);
+  state.shake = Math.max(state.shake, IS_MOBILE ? 0.22 : 0.28);
 }
 
 function stopFever() {
@@ -214,8 +234,7 @@ function resetGameForIntro(introSeconds) {
   state.comboTimer = 0;
   stopFever();
 
-  const w = window.innerWidth;
-  const h = window.innerHeight;
+  const { w, h } = getViewportSize();
 
   state.face.r = Math.min(w, h) * 0.10;
   state.face.x = rand(state.face.r, w - state.face.r);
@@ -236,11 +255,11 @@ function resetGameForIntro(introSeconds) {
 
   elScore.textContent = "0";
   elTime.textContent = GAME_SECONDS.toFixed(1);
-
 }
 
 function spawnParticles(x, y, n = 18) {
-  for (let i = 0; i < n; i++) {
+  const nn = IS_MOBILE ? Math.max(6, Math.floor(n * 0.5)) : n;
+  for (let i = 0; i < nn; i++) {
     const a = rand(0, Math.PI * 2);
     const sp = rand(140, 620);
     state.particles.push({
@@ -256,7 +275,11 @@ function spawnParticles(x, y, n = 18) {
 function pointInFace(px, py) {
   const dx = px - state.face.x;
   const dy = py - state.face.y;
-  return (dx * dx + dy * dy) <= (state.face.r * state.face.r);
+
+  const pad = IS_MOBILE ? 1.40 : 1.15; // bigger on mobile
+  const rr = (state.face.r * pad);
+
+  return (dx * dx + dy * dy) <= (rr * rr);
 }
 
 function endGame() {
@@ -287,7 +310,11 @@ function startGame() {
   state.lastT = performance.now();
 
   addFloater("GET READY...", state.face.x, state.face.y - state.face.r - 10, {
-    size: 34, life: 1.0, rise: 50, wobble: 8, weight: 1200
+    size: IS_MOBILE ? 30 : 34,
+    life: 1.0,
+    rise: 50,
+    wobble: 8,
+    weight: 1200
   });
 
   hasStartedOnce = true;
@@ -321,16 +348,19 @@ canvas.addEventListener("pointerdown", (e) => {
     elScore.textContent = String(state.score);
 
     addFloater(`+${add}`, state.face.x, state.face.y - state.face.r * 0.15, {
-      size: 30, life: 0.65, rise: 130, wobble: 10, weight: 1200
+      size: IS_MOBILE ? 26 : 30, life: 0.65, rise: 130, wobble: 10, weight: 1200
     });
 
-    const words = ["SPLASH!!", "BOON!!", "ﾍﾞﾁｬ!!"];
-    const w = words[(Math.random() * words.length) | 0];
-    addFloater(w, state.face.x, state.face.y - state.face.r - 10, {
-      size: 38, life: 0.80, rise: 120, wobble: 18, weight: 1200
-    });
+    // mobile: remove random onomatopoeia floater (heavy text + stroke)
+    if (!IS_MOBILE) {
+      const words = ["SPLASH!!", "BOON!!", "ﾍﾞﾁｬ!!"];
+      const w = words[(Math.random() * words.length) | 0];
+      addFloater(w, state.face.x, state.face.y - state.face.r - 10, {
+        size: 38, life: 0.80, rise: 120, wobble: 18, weight: 1200
+      });
+    }
 
-    if (state.combo >= 3) {
+    if (state.combo >= 3 && !IS_MOBILE) {
       addFloater(`${state.combo} COMBO!!`, state.face.x, state.face.y + state.face.r + 8, {
         size: 30 + Math.min(20, state.combo * 2),
         life: 0.60, rise: 70, wobble: 12, weight: 1200
@@ -347,13 +377,13 @@ canvas.addEventListener("pointerdown", (e) => {
       elScore.textContent = String(state.score);
 
       addFloater(`+${bonus} BONUS!!`, state.face.x, state.face.y, {
-        size: 44, life: 1.00, rise: 160, wobble: 22, weight: 1300
+        size: IS_MOBILE ? 36 : 44, life: 1.00, rise: 160, wobble: 22, weight: 1300
       });
 
       // ★ボーナスヒット音
       playHitBonus();
 
-      state.shake = Math.max(state.shake, 0.35);
+      state.shake = Math.max(state.shake, IS_MOBILE ? 0.28 : 0.35);
     }
 
     // 10連続でFEVER開始（startFever内でhit02鳴る）
@@ -366,7 +396,7 @@ canvas.addEventListener("pointerdown", (e) => {
 
     state.shake = Math.max(
       state.shake,
-      (state.fever ? 0.22 : 0.18) + Math.min(0.22, state.combo * 0.012)
+      (state.fever ? (IS_MOBILE ? 0.18 : 0.22) : (IS_MOBILE ? 0.15 : 0.18)) + Math.min(0.22, state.combo * 0.012)
     );
 
     spawnParticles(state.face.x, state.face.y, 26);
@@ -426,7 +456,7 @@ function update(dt) {
 
     // 通常カウントダウン
     state.introLeft = Math.max(0, state.introLeft - dt);
-    elTime.textContent = GAME_SECONDS.toFixed(1); 
+    elTime.textContent = GAME_SECONDS.toFixed(1);
 
     // ★3秒前になったら count.mp3 を1回だけ再生
     if (!state.countPlayed && state.introLeft <= 3.0) {
@@ -457,10 +487,10 @@ function update(dt) {
 
       // GOフローター（表示時間はGO_HOLD_SECONDSに合わせる）
       addFloater("GO!!", state.face.x, state.face.y - state.face.r - 10, {
-        size: 52, life: GO_HOLD_SECONDS, rise: 140, wobble: 16, weight: 1300
+        size: IS_MOBILE ? 46 : 52, life: GO_HOLD_SECONDS, rise: 140, wobble: 16, weight: 1300
       });
 
-      state.shake = Math.max(state.shake, 0.22);
+      state.shake = Math.max(state.shake, IS_MOBILE ? 0.18 : 0.22);
     }
 
     return;
@@ -480,8 +510,7 @@ function update(dt) {
   f.x += f.vx * dt;
   f.y += f.vy * dt;
 
-  const w = window.innerWidth;
-  const h = window.innerHeight;
+  const { w, h } = getViewportSize();
 
   const topMargin = 56;
   if (f.x - f.r < 0) { f.x = f.r; f.vx *= -1; }
@@ -519,8 +548,7 @@ function update(dt) {
 }
 
 function drawIntroCountdown() {
-  const w = window.innerWidth;
-  const h = window.innerHeight;
+  const { w, h } = getViewportSize();
 
   const left = state.introLeft;
 
@@ -545,7 +573,7 @@ function drawIntroCountdown() {
 
   // 上の "GET READY" は常に出す
   ctx.font = `900 24px system-ui, sans-serif`;
-  ctx.lineWidth = 8;
+  ctx.lineWidth = IS_MOBILE ? 5 : 8;
   ctx.strokeStyle = "rgba(0,0,0,0.65)";
   ctx.strokeText("GET READY", w / 2, h / 2 - 110);
   ctx.fillStyle = "rgba(255,255,255,0.98)";
@@ -560,8 +588,8 @@ function drawIntroCountdown() {
   // 5..0, GO!
   const text = isGo ? "GO!" : String(n);
 
-  ctx.font = `${Math.floor(120 * pulse)}px system-ui, sans-serif`;
-  ctx.lineWidth = 14;
+  ctx.font = `${Math.floor((IS_MOBILE ? 100 : 120) * pulse)}px system-ui, sans-serif`;
+  ctx.lineWidth = IS_MOBILE ? 10 : 14;
   ctx.strokeStyle = "rgba(0,0,0,0.65)";
   ctx.strokeText(text, w / 2, h / 2);
   ctx.fillStyle = "rgba(255,255,255,0.98)";
@@ -570,10 +598,8 @@ function drawIntroCountdown() {
   ctx.restore();
 }
 
-
 function draw() {
-  const w = window.innerWidth;
-  const h = window.innerHeight;
+  const { w, h } = getViewportSize();
 
   let ox = 0, oy = 0;
   if (state.shake > 0) {
@@ -612,7 +638,7 @@ function draw() {
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
 
-    ctx.lineWidth = 8;
+    ctx.lineWidth = IS_MOBILE ? 4 : 8;
     ctx.strokeStyle = "rgba(0,0,0,0.60)";
     ctx.strokeText(ft.text, xx, yy);
 
@@ -641,7 +667,6 @@ function draw() {
   ctx.drawImage(img, f.x - size / 2, f.y - size / 2, size, size);
   ctx.restore();
 
-
   ctx.lineWidth = 4;
   ctx.strokeStyle = "rgba(255,255,255,0.22)";
   ctx.beginPath();
@@ -654,7 +679,6 @@ function draw() {
 
   ctx.restore();
 
-
   ctx.save();
   ctx.globalAlpha = 0.95;
   ctx.textAlign = "right";
@@ -662,16 +686,15 @@ function draw() {
 
   const pad = 14;
   const hudX = w - pad;
-  const hudY = 60;        
-  const lineH = 28;      
+  const hudY = 60;
+  const lineH = 28;
 
-  // ★Canvasで確実に有効なweightにする（700/800/900）
   const comboFont = `900 20px system-ui, sans-serif`;
   const feverFont = `900 22px system-ui, sans-serif`;
 
   function drawHudText(text, x, y, font) {
-    ctx.font = font; // ★毎回必ずセット
-    ctx.lineWidth = 6;
+    ctx.font = font;
+    ctx.lineWidth = IS_MOBILE ? 4 : 6;
     ctx.strokeStyle = "rgba(0,0,0,0.60)";
     ctx.strokeText(text, x, y);
     ctx.fillStyle = "white";
@@ -689,7 +712,6 @@ function draw() {
   }
 
   ctx.restore();
-
 }
 
 function loop(t) {
