@@ -14,6 +14,19 @@
 //   - 画面オーバーレイ（脈動）
 //   - FEVER突入フラッシュ + リング
 //   - 敵画像を虹色（hue-rotate）で変色（主にFEVER中）
+// - Ranking fixes:
+//   - START画面は右上RANKボタンでモーダル表示（閲覧のみ）
+//   - RESULT画面は「結果BOX」+「ランキングBOX」の2箱縦並び
+//   - 1ゲーム1回だけ送信（多重送信防止）
+//   - ランキングBOXはスクロール、RETRYは常に押せる
+
+window.addEventListener("error", (e) => {
+  alert("JS ERROR: " + (e?.message || e));
+});
+window.addEventListener("unhandledrejection", (e) => {
+  alert("PROMISE ERROR: " + (e?.reason?.message || e?.reason || e));
+});
+
 
 const canvas = document.getElementById("game");
 const ctx = canvas.getContext("2d", { alpha: false });
@@ -34,6 +47,332 @@ function rand(a, b) { return a + Math.random() * (b - a); }
 // ---- Mobile detect & viewport size ----
 const IS_MOBILE = matchMedia("(pointer: coarse)").matches;
 
+const API_BASE = "https://rank-api.atack-rank.workers.dev";
+
+async function submitScore(name, score) {
+  const r = await fetch(`${API_BASE}/submit`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, score }),
+  });
+  return r.json();
+}
+
+async function fetchTop(limit = 20) {
+  const r = await fetch(`${API_BASE}/top?limit=${limit}`);
+  return r.json();
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;"
+  }[c]));
+}
+
+// =========================
+// Ranking UI (INLINE + MODAL 分離：ID重複なし)
+// =========================
+function createRankBox(kind /* "inline" | "modal" */) {
+  const box = document.createElement("div");
+  box.className = `rankBox rankBox-${kind}`;
+  box.style.width = "min(86vw, 420px)";
+  box.style.padding = "10px 12px";
+  box.style.borderRadius = "14px";
+  box.style.background = "rgba(255,255,255,0.08)";
+  box.style.boxShadow = "0 10px 28px rgba(0,0,0,0.25)";
+  box.style.backdropFilter = "blur(6px)";
+  box.style.boxSizing = "border-box";
+  box.style.color = "rgba(255,255,255,0.95)";
+
+
+  const title = document.createElement("div");
+  title.textContent = "RANKING";
+  title.style.fontWeight = "900";
+  title.style.letterSpacing = "0.08em";
+  title.style.textAlign = "center";
+  title.style.marginBottom = "8px";
+  title.style.color = "rgba(255,255,255,0.95)";
+
+  box.appendChild(title);
+
+  const row = document.createElement("div");
+  row.className = "rankRow";
+  row.style.display = "grid";
+  row.style.gap = "8px";
+  row.style.alignItems = "center";
+  box.appendChild(row);
+
+  const input = document.createElement("input");
+  input.className = "rankName";
+  input.type = "text";
+  input.maxLength = 16;
+  input.placeholder = "ユーザ名（16文字まで）";
+  input.value = localStorage.getItem("rank_name") || "";
+  input.style.width = "100%";
+  input.style.padding = "10px 12px";
+  input.style.borderRadius = "12px";
+  input.style.border = "1px solid rgba(255,255,255,0.18)";
+  input.style.background = "rgba(0,0,0,0.25)";
+  input.style.color = "rgba(255,255,255,0.95)";
+  input.style.outline = "none";
+  input.style.minWidth = "0"; // grid内で潰れても重なりにくくする
+  row.appendChild(input);
+
+  const send = document.createElement("button");
+  send.className = "rankSend";
+  send.textContent = "送信";
+  send.style.padding = "10px 12px";
+  send.style.borderRadius = "12px";
+  send.style.border = "1px solid rgba(255,255,255,0.20)";
+  send.style.background = "rgba(255,255,255,0.12)";
+  send.style.color = "rgba(255,255,255,0.95)";
+  send.style.fontWeight = "800";
+  send.style.cursor = "pointer";
+  row.appendChild(send);
+
+  const refreshBtn = document.createElement("button");
+  refreshBtn.className = "rankRefresh";
+  refreshBtn.textContent = "更新";
+  refreshBtn.style.padding = "10px 12px";
+  refreshBtn.style.borderRadius = "12px";
+  refreshBtn.style.border = "1px solid rgba(255,255,255,0.20)";
+  refreshBtn.style.background = "rgba(255,255,255,0.12)";
+  refreshBtn.style.color = "rgba(255,255,255,0.95)";
+  refreshBtn.style.fontWeight = "800";
+  refreshBtn.style.cursor = "pointer";
+  row.appendChild(refreshBtn);
+
+  const msg = document.createElement("div");
+  msg.className = "rankMsg";
+  msg.style.opacity = "0.9";
+  msg.style.fontSize = "12px";
+  msg.style.marginTop = "6px";
+  msg.style.textAlign = "center";
+  msg.textContent = "ランキング取得中…";
+  box.appendChild(msg);
+
+  const list = document.createElement("div");
+  list.className = "rankList";
+  list.style.marginTop = "8px";
+  list.style.display = "grid";
+  list.style.gap = "6px";
+
+  // 縦スクロール
+  list.style.maxHeight = (kind === "modal") ? "52vh" : "26vh";
+  list.style.overflowY = "auto";
+  list.style.overflowX = "hidden";
+  list.style.webkitOverflowScrolling = "touch";
+
+  box.appendChild(list);
+
+  return box;
+}
+
+function getRankEls(box) {
+  return {
+    row: box.querySelector(".rankRow"),
+    input: box.querySelector(".rankName"),
+    send: box.querySelector(".rankSend"),
+    refresh: box.querySelector(".rankRefresh"),
+    msg: box.querySelector(".rankMsg"),
+    list: box.querySelector(".rankList"),
+  };
+}
+
+function setRankingModeOnBox(box, mode /* "view" | "submit" */) {
+  const { row, input, send, refresh, msg } = getRankEls(box);
+  if (!row || !input || !send || !refresh || !msg) return;
+
+  if (mode === "view") {
+    row.style.gridTemplateColumns = "minmax(0, 1fr) auto auto";
+    input.style.display = "none";
+    send.style.display = "none";
+    refresh.style.display = "inline-block";
+    msg.textContent = "ランキング表示（更新できます）";
+  } else {
+    row.style.gridTemplateColumns = "1fr auto auto";
+    input.style.display = "block";
+    send.style.display = "inline-block";
+    refresh.style.display = "inline-block";
+    input.disabled = false;
+
+    if (state.rankSubmitted) {
+      send.disabled = true;
+      send.textContent = "送信済み";
+      input.disabled = true;
+      msg.textContent = "送信済み！（この回は1回だけ）";
+    } else {
+      send.disabled = false;
+      send.textContent = "送信";
+      msg.textContent = "送信してランキングに参加しよう！";
+    }
+  }
+}
+
+async function refreshRankingOnBox(box, limit = 20) {
+  const { msg, list } = getRankEls(box);
+  try {
+    if (msg) msg.textContent = "ランキング更新中…";
+    const data = await fetchTop(limit);
+    const top = (data && data.top) ? data.top : [];
+
+    if (list) {
+      list.innerHTML = top.map((r, i) => {
+        const name = escapeHtml(r.name);
+        const score = Number(r.score) | 0;
+        return `<div style="color:rgba(255,255,255,0.95);display:flex;justify-content:space-between;gap:10px;
+             padding:8px 10px;border-radius:12px;
+             background:rgba(0,0,0,0.22);border:1px solid rgba(255,255,255,0.10);">
+          <div style="font-weight:800;">${i + 1}. ${name}</div>
+          <div style="font-weight:900;">${score}</div>
+        </div>`;
+
+      }).join("");
+    }
+
+    if (msg) {
+      msg.textContent = state.rankSubmitted ? "送信済み！" : "ランキング表示中（更新できます）";
+    }
+  } catch (e) {
+    console.error(e);
+    if (msg) msg.textContent = "ランキング取得に失敗（通信/URLを確認）";
+  }
+}
+
+async function submitMyScoreOnBox(box, finalScore) {
+  const { input, msg, send } = getRankEls(box);
+
+  if (state.rankSubmitting) { if (msg) msg.textContent = "送信中…"; return; }
+  if (state.rankSubmitted)  { if (msg) msg.textContent = "送信済み！"; return; }
+
+  const name = (input ? input.value : "").trim();
+  if (!name) { if (msg) msg.textContent = "名前を入力してね"; return; }
+
+  localStorage.setItem("rank_name", name);
+
+  try {
+    state.rankSubmitting = true;
+    if (send) send.disabled = true;
+    if (msg) msg.textContent = "送信中…";
+
+    const res = await submitScore(name, finalScore);
+    if (!res || res.ok !== true) {
+      if (msg) msg.textContent = "送信失敗：" + (res && res.error ? res.error : "unknown");
+      if (send) send.disabled = false;
+      return;
+    }
+
+    state.rankSubmitted = true;
+
+    if (send) { send.disabled = true; send.textContent = "送信済み"; }
+    if (input) input.disabled = true;
+    if (msg) msg.textContent = "送信OK！ランキング更新中…";
+
+    await refreshRankingOnBox(box, 20);
+
+    if (msg) msg.textContent = "送信済み！（この回は1回だけ）";
+  } catch (e) {
+    console.error(e);
+    if (msg) msg.textContent = "送信に失敗（通信/URLを確認）";
+    if (send && !state.rankSubmitted) send.disabled = false;
+  } finally {
+    state.rankSubmitting = false;
+  }
+}
+
+// ---- INLINE Rank box on RESULT ----
+let rankInlineBox = null;
+function ensureRankInlineBox(parent) {
+  if (rankInlineBox && rankInlineBox.isConnected) return rankInlineBox;
+  rankInlineBox = createRankBox("inline");
+  parent.appendChild(rankInlineBox);
+
+  const { refresh, send } = getRankEls(rankInlineBox);
+  if (refresh) refresh.onclick = () => refreshRankingOnBox(rankInlineBox, 20);
+  if (send) send.onclick = () => submitMyScoreOnBox(rankInlineBox, state.score);
+
+  return rankInlineBox;
+}
+
+// ---- MODAL Rank box (STARTから閲覧) ----
+let rankModal = null;
+let rankModalBox = null;
+
+function ensureRankModal() {
+  if (rankModal) return rankModal;
+
+  const back = document.createElement("div");
+  back.id = "rankModal";
+  back.style.position = "absolute";
+  back.style.inset = "0";
+  back.style.display = "none";
+  back.style.alignItems = "center";
+  back.style.justifyContent = "center";
+  back.style.background = "rgba(0,0,0,0.55)";
+  back.style.zIndex = "30";
+  back.style.padding = "18px";
+  back.style.boxSizing = "border-box";
+
+  const panel = document.createElement("div");
+  panel.style.width = "min(92vw, 460px)";
+  panel.style.borderRadius = "16px";
+  panel.style.background = "rgba(20,22,26,0.92)";
+  panel.style.border = "1px solid rgba(255,255,255,0.10)";
+  panel.style.boxShadow = "0 14px 40px rgba(0,0,0,0.45)";
+  panel.style.backdropFilter = "blur(10px)";
+  panel.style.padding = "12px";
+  panel.style.position = "relative";
+  panel.style.boxSizing = "border-box";
+  back.appendChild(panel);
+
+  const close = document.createElement("button");
+  close.textContent = "×";
+  close.style.position = "absolute";
+  close.style.top = "10px";
+  close.style.right = "12px";
+  close.style.width = "40px";
+  close.style.height = "40px";
+  close.style.borderRadius = "12px";
+  close.style.border = "1px solid rgba(255,255,255,0.18)";
+  close.style.background = "rgba(255,255,255,0.10)";
+  close.style.color = "rgba(255,255,255,0.95)";
+  close.style.fontSize = "22px";
+  close.style.fontWeight = "900";
+  close.style.cursor = "pointer";
+  close.onclick = () => closeRankModal();
+  panel.appendChild(close);
+
+  rankModalBox = createRankBox("modal");
+  panel.appendChild(rankModalBox);
+
+  const { refresh, send } = getRankEls(rankModalBox);
+  if (refresh) refresh.onclick = () => refreshRankingOnBox(rankModalBox, 20);
+  if (send) send.onclick = () => submitMyScoreOnBox(rankModalBox, state.score);
+
+  back.addEventListener("pointerdown", (e) => {
+    if (e.target === back) closeRankModal();
+  }, { passive: true });
+
+  overlay.style.position = "relative";
+  overlay.appendChild(back);
+
+  rankModal = back;
+  return rankModal;
+}
+
+function openRankModal(mode /* "view" | "submit" */) {
+  ensureRankModal();
+  setRankingModeOnBox(rankModalBox, mode);
+  rankModal.style.display = "flex";
+  refreshRankingOnBox(rankModalBox, 20);
+}
+
+function closeRankModal() {
+  if (!rankModal) return;
+  rankModal.style.display = "none";
+}
+
+// ---- viewport sizing ----
 function getViewportSize() {
   const vv = window.visualViewport;
   const w = vv ? vv.width : window.innerWidth;
@@ -79,9 +418,8 @@ makeDotSprite();
 
 // ---- Rainbow fallback for mobile (when ctx.filter doesn't work) ----
 const HAS_CTX_FILTER = ("filter" in ctx);
-const RAINBOW_STEP_DEG = 12; // 粗く刻んでキャッシュ（軽量化）
-
-const rainbowCache = new Map(); // key -> canvas
+const RAINBOW_STEP_DEG = 12;
+const rainbowCache = new Map();
 
 function rgbToHsl(r, g, b) {
   r /= 255; g /= 255; b /= 255;
@@ -128,7 +466,6 @@ function getRainbowCanvas(img, hueDeg, sizePx) {
   const cached = rainbowCache.get(key);
   if (cached) return cached;
 
-  // 作成
   const c = document.createElement("canvas");
   c.width = sizePx;
   c.height = sizePx;
@@ -149,12 +486,10 @@ function getRainbowCanvas(img, hueDeg, sizePx) {
   }
   g.putImageData(im, 0, 0);
 
-  // キャッシュ肥大防止（適当な上限）
   if (rainbowCache.size > 80) rainbowCache.clear();
   rainbowCache.set(key, c);
   return c;
 }
-
 
 // ---- image assets ----
 const assets = {
@@ -162,7 +497,7 @@ const assets = {
   faceHit: new Image(),
 };
 assets.face.src = "./assets/face.png";
-assets.faceHit.src = "./assets/face_hit.png"; // 無ければ face.png をコピーでOK
+assets.faceHit.src = "./assets/face_hit.png";
 
 // ---- WebAudio (fast, tap-safe) ----
 let audioCtx = null;
@@ -289,7 +624,7 @@ function pickResultPack(score) {
   return packs[packs.length - 1] || null;
 }
 
-const resultImgCache = new Map(); // url -> Image
+const resultImgCache = new Map();
 
 async function preloadResultImages() {
   const packs = window.RESULT_PACKS;
@@ -305,10 +640,8 @@ async function preloadResultImages() {
     im.src = url;
     resultImgCache.set(url, im);
 
-    // decodeできる環境は先にdecodeしておく
-    if (im.decode) {
-      tasks.push(im.decode().catch(() => {}));
-    } else {
+    if (im.decode) tasks.push(im.decode().catch(() => {}));
+    else {
       tasks.push(new Promise((r) => {
         im.onload = () => r();
         im.onerror = () => r();
@@ -319,7 +652,6 @@ async function preloadResultImages() {
   await Promise.all(tasks);
 }
 
-// RESULT_PACKS が読み込まれてから実行（script順が不明でも安全）
 (function waitAndPreload() {
   let tries = 0;
   const timer = setInterval(() => {
@@ -331,7 +663,6 @@ async function preloadResultImages() {
   }, 100);
 })();
 
-
 function pickRandom(arr) {
   if (!Array.isArray(arr) || arr.length === 0) return "";
   return arr[(Math.random() * arr.length) | 0];
@@ -340,22 +671,17 @@ function pickRandom(arr) {
 function renderResultWithPack(score) {
   const pack = pickResultPack(score);
 
-  // 既存表示をクリア
-  resultEl.textContent = "";
-
   const wrap = document.createElement("div");
   wrap.style.display = "grid";
   wrap.style.gap = "10px";
   wrap.style.justifyItems = "center";
 
-  // ★画像があるときは、画像が来るまで文字だけ出さない（違和感防止）
+  // 画像読み込み中の違和感防止
   const needsImg = !!(pack && pack.img);
   if (needsImg) wrap.style.visibility = "hidden";
 
   if (pack && pack.img) {
     const img = document.createElement("img");
-
-    // ★キャッシュがあればそれを優先（ロード済みの可能性が高い）
     const cached = resultImgCache.get(pack.img);
     img.src = cached ? cached.src : pack.img;
 
@@ -376,7 +702,6 @@ function renderResultWithPack(score) {
 
     wrap.appendChild(img);
   } else {
-    // 画像が無いパックならすぐ表示
     wrap.style.visibility = "visible";
   }
 
@@ -394,7 +719,7 @@ function renderResultWithPack(score) {
   scoreLine.style.fontWeight = "700";
   wrap.appendChild(scoreLine);
 
-  resultEl.appendChild(wrap);
+  return wrap;
 }
 
 // ---- best ----
@@ -413,7 +738,6 @@ const COMBO_BONUS_PTS = 5;
 const FEVER_EVERY = 50;
 const FEVER_SECONDS = 7.0;
 
-// 速度の上限（暴走防止）
 function speedLimit() {
   const { w, h } = getViewportSize();
   const s = Math.min(w, h);
@@ -446,10 +770,12 @@ const state = {
   feverTimer: 0,
   scoreMul: 1,
 
-  // ★FEVER演出用
-  feverFlash: 0,   // 秒：突入フラッシュ
-  feverBurst: 0,   // 0..1：リングなど
-  hueTime: 0,      // 虹色変色の位相
+  feverFlash: 0,
+  feverBurst: 0,
+  hueTime: 0,
+
+  rankSubmitted: false,
+  rankSubmitting: false,
 
   face: {
     x: 120,
@@ -495,10 +821,9 @@ function addFloater(text, x, y, opts = {}) {
 
 function startFever(seconds = FEVER_SECONDS) {
   state.fever = true;
-  state.feverTimer = seconds;   // 再突入で更新
+  state.feverTimer = seconds;
   state.scoreMul = 2;
 
-  // ★突入演出
   state.feverFlash = 0.18;
   state.feverBurst = 1.0;
 
@@ -543,6 +868,10 @@ function resetGameForIntro(introSeconds) {
   state.feverFlash = 0;
   state.feverBurst = 0;
   state.hueTime = 0;
+
+  // 新ゲーム開始 → 送信状態リセット
+  state.rankSubmitted = false;
+  state.rankSubmitting = false;
 
   const { w, h } = getViewportSize();
 
@@ -598,6 +927,8 @@ function pointInFace(px, py) {
 }
 
 function endGame() {
+  overlay.style.display = "flex"; // overlay を flex運用してるので
+
   state.running = false;
   overlay.classList.remove("hidden");
 
@@ -609,8 +940,40 @@ function endGame() {
   } else {
     titleEl.textContent = "RESULT";
   }
-  renderResultWithPack(state.score);
+
+  // RESULT画面：2箱縦並び（結果BOX + ランキングBOX）
+  resultEl.textContent = "";
+  resultEl.style.display = "grid";
+  resultEl.style.gap = "12px";
+  resultEl.style.justifyItems = "center";
+  resultEl.style.width = "min(86vw, 420px)";
+  resultEl.style.boxSizing = "border-box";
+
+  // 1) 結果BOX
+  const resultWrap = renderResultWithPack(state.score);
+  resultWrap.style.width = "100%";
+  resultWrap.style.padding = "10px 12px";
+  resultWrap.style.borderRadius = "14px";
+  resultWrap.style.background = "rgba(255,255,255,0.08)";
+  resultWrap.style.boxShadow = "0 10px 28px rgba(0,0,0,0.25)";
+  resultWrap.style.backdropFilter = "blur(6px)";
+  resultWrap.style.boxSizing = "border-box";
+  resultEl.appendChild(resultWrap);
+
+  // 2) ランキングBOX（送信モード）
+  const box = ensureRankInlineBox(resultEl);
+  setRankingModeOnBox(box, "submit");
+
+  const { send } = getRankEls(box);
+  if (send) send.onclick = () => submitMyScoreOnBox(box, state.score);
+
+  refreshRankingOnBox(box, 20);
+
   btn.textContent = "RETRY";
+
+  // RETRY最前面
+  btn.style.position = "relative";
+  btn.style.zIndex = "10";
 }
 
 async function startGame() {
@@ -630,6 +993,7 @@ async function startGame() {
 
     state.running = true;
     overlay.classList.add("hidden");
+    overlay.style.display = "none";
     state.lastT = performance.now();
 
     addFloater("GET READY...", state.face.x, state.face.y - state.face.r - 10, {
@@ -769,10 +1133,8 @@ function updateFloaters(dt) {
 }
 
 function update(dt) {
-  // 虹色位相（常に回してOK。軽い）
   state.hueTime += dt;
 
-  // 突入フラッシュ/リング減衰
   if (state.feverFlash > 0) state.feverFlash = Math.max(0, state.feverFlash - dt);
   if (state.feverBurst > 0) state.feverBurst = Math.max(0, state.feverBurst - dt * 2.6);
 
@@ -915,17 +1277,14 @@ function draw() {
   ctx.fillStyle = BG_COLOR;
   ctx.fillRect(0, 0, w, h);
 
-  // ---- FEVER overlay (脈動) ----
   if (state.fever) {
-    // うっすら色を被せる（重くならない）
     const pulse = 0.06 + 0.03 * Math.sin(state.hueTime * 6.0);
     ctx.globalAlpha = pulse;
-    ctx.fillStyle = "rgba(180,220,255,1)"; // 青白
+    ctx.fillStyle = "rgba(180,220,255,1)";
     ctx.fillRect(0, 0, w, h);
     ctx.globalAlpha = 1;
   }
 
-  // particles
   if (dotSprite) {
     for (let i = 0; i < state.particles.length; i++) {
       const p = state.particles[i];
@@ -937,7 +1296,6 @@ function draw() {
     ctx.globalAlpha = 1;
   }
 
-  // floaters
   for (let i = 0; i < state.floaters.length; i++) {
     const ft = state.floaters[i];
     const pp = ft.t / ft.life;
@@ -959,14 +1317,12 @@ function draw() {
   }
   ctx.globalAlpha = 1;
 
-  // enemy (face)
   const f = state.face;
   const img = (f.hitTimer > 0 ? assets.faceHit : assets.face);
 
   const pop = (f.scalePop > 0) ? (1 + 0.18 * (f.scalePop / 0.20)) : 1;
   const size = (f.r * 2) * pop;
 
-  // shadow
   ctx.globalAlpha = 0.32;
   ctx.beginPath();
   ctx.ellipse(f.x, f.y + f.r * 0.78, f.r * 0.95, f.r * 0.35, 0, 0, Math.PI * 2);
@@ -974,10 +1330,8 @@ function draw() {
   ctx.fill();
   ctx.globalAlpha = 1;
 
-  // ★虹色変色：FEVER中は強め、通常時は弱め（好みで通常時0にしてもOK）
-  // 端末によって ctx.filter 非対応の場合があるが、非対応なら無視されて普通に描画される
   const hueDeg = (state.hueTime * 220 + (f.x + f.y) * 0.15) % 360;
-  const hueStrength = state.fever ? 1.0 : 0.0; // 通常時も少し変えたいなら0.25、完全OFFなら0.0
+  const hueStrength = state.fever ? 1.0 : 0.0;
 
   ctx.save();
   ctx.beginPath();
@@ -993,18 +1347,13 @@ function draw() {
     ctx.drawImage(img, f.x - size / 2, f.y - size / 2, size, size);
     ctx.filter = "none";
   } else if (useRainbow && !HAS_CTX_FILTER) {
-    // iOS等でfilterが効かない場合：敵だけ色相回転したcanvasを使う（キャッシュ）
     const sp = Math.max(32, (size | 0));
     const rc = getRainbowCanvas(img, hueDeg, sp);
-    if (rc) {
-      ctx.drawImage(rc, f.x - size / 2, f.y - size / 2, size, size);
-    } else {
-      ctx.drawImage(img, f.x - size / 2, f.y - size / 2, size, size);
-    }
+    if (rc) ctx.drawImage(rc, f.x - size / 2, f.y - size / 2, size, size);
+    else ctx.drawImage(img, f.x - size / 2, f.y - size / 2, size, size);
   } else {
     ctx.drawImage(img, f.x - size / 2, f.y - size / 2, size, size);
   }
-
 
   ctx.filter = "none";
   ctx.restore();
@@ -1015,11 +1364,8 @@ function draw() {
   ctx.arc(f.x, f.y, (f.r * pop), 0, Math.PI * 2);
   ctx.stroke();
 
-  if (state.phase === "intro") {
-    drawIntroCountdown();
-  }
+  if (state.phase === "intro") drawIntroCountdown();
 
-  // ---- FEVER enter flash + ring (cheap) ----
   if (state.feverFlash > 0 || state.feverBurst > 0) {
     const aFlash = Math.min(1, state.feverFlash / 0.18);
     if (aFlash > 0) {
@@ -1030,7 +1376,7 @@ function draw() {
       ctx.restore();
     }
 
-    const b = state.feverBurst; // 0..1
+    const b = state.feverBurst;
     if (b > 0) {
       const cx = f.x, cy = f.y;
       const r0 = f.r * 0.8;
@@ -1093,8 +1439,172 @@ function loop(t) {
   }
 }
 
+
+// ★overlay を必ず最前面に出す（START画面が消える主因＝z-index負け対策）
+canvas.style.position = "fixed";
+canvas.style.inset = "0";
+canvas.style.zIndex = "1";
+
+overlay.style.position = "fixed";
+overlay.style.inset = "0";
+overlay.style.zIndex = "50";
+overlay.style.pointerEvents = "auto"; // 念のため
+
 // ---- initial overlay ----
 overlay.classList.remove("hidden");
 titleEl.textContent = "Atack Oohigashi!!";
 resultEl.textContent = "STARTを押してね";
 btn.textContent = "START";
+
+// ★canvas / overlay の前後関係を固定（前回の対策を維持）
+canvas.style.position = "fixed";
+canvas.style.inset = "0";
+canvas.style.zIndex = "1";
+
+overlay.style.position = "fixed";
+overlay.style.inset = "0";
+overlay.style.zIndex = "50";
+overlay.style.pointerEvents = "auto";
+
+// ★overlay は「画面中央寄せ」
+overlay.style.display = "flex";
+overlay.style.alignItems = "center";
+overlay.style.justifyContent = "center";
+overlay.style.padding = "18px";
+overlay.style.boxSizing = "border-box";
+
+// ★START箱（パネル）を作って、中に title/result/button をまとめる
+(function ensureStartPanel() {
+  let panel = document.getElementById("startPanel");
+  if (!panel) {
+    panel = document.createElement("div");
+    panel.id = "startPanel";
+    panel.style.width = "min(92vw, 520px)";
+    panel.style.borderRadius = "18px";
+    panel.style.background = "rgba(20,22,26,0.88)";
+    panel.style.border = "1px solid rgba(255,255,255,0.10)";
+    panel.style.boxShadow = "0 14px 44px rgba(0,0,0,0.45)";
+    panel.style.backdropFilter = "blur(10px)";
+    panel.style.padding = "18px 18px 16px";
+    panel.style.boxSizing = "border-box";
+    panel.style.display = "grid";
+    panel.style.gap = "10px";
+    panel.style.justifyItems = "center";
+    panel.style.position = "relative"; // ← RANKボタンを箱の右上に置く
+    panel.style.color = "rgba(255,255,255,0.95)";
+
+    while (overlay.firstChild) overlay.removeChild(overlay.firstChild);
+    // overlayを一旦空にして、panelを載せる
+    overlay.appendChild(panel);
+  }
+
+  // ★既存DOMを panel 内へ移動
+  panel.appendChild(titleEl);
+  panel.appendChild(resultEl);
+  panel.appendChild(btn);
+
+  // ★result領域は STARTではスクロールさせない（モーダルで見る）
+  resultEl.style.width = "100%";
+  resultEl.style.maxHeight = "";
+  resultEl.style.overflow = "";
+  resultEl.style.paddingBottom = "";
+
+  // ★ボタン配置
+  btn.style.marginTop = "6px";
+  btn.style.position = "relative";
+  btn.style.zIndex = "5";
+
+  // ===== FIX: overlay / panel centering + text alignment =====
+  (function forceCenterFix() {
+    // overlayを visualViewport に合わせて「本当に中央」にする（iOS/PC両対応）
+    const vv = window.visualViewport;
+    const W = vv ? vv.width  : window.innerWidth;
+    const H = vv ? vv.height : window.innerHeight;
+    const top = vv ? vv.offsetTop  : 0;
+    const left= vv ? vv.offsetLeft : 0;
+
+    overlay.style.position = "fixed";
+    overlay.style.left = left + "px";
+    overlay.style.top  = top  + "px";
+    overlay.style.width  = W + "px";
+    overlay.style.height = H + "px";
+
+    overlay.style.display = "flex";
+    overlay.style.flexDirection = "column";
+    overlay.style.alignItems = "center";
+    overlay.style.justifyContent = "center";
+    overlay.style.padding = "18px";
+    overlay.style.boxSizing = "border-box";
+
+    // panel内のテキストが左寄りになるのを強制で潰す
+    const panel = document.getElementById("startPanel");
+    if (panel) {
+      panel.style.textAlign = "center";
+      panel.style.justifyItems = "center";
+    }
+
+    // title/result/button を中央寄せ + 余計なmargin消し
+    [titleEl, resultEl].forEach(el => {
+      if (!el) return;
+      el.style.width = "100%";
+      el.style.textAlign = "center";
+      el.style.marginLeft = "0";
+      el.style.marginRight = "0";
+    });
+
+    if (btn) {
+      btn.style.alignSelf = "center";
+    }
+  })();
+
+  // resizeでも追従
+  window.visualViewport?.addEventListener("resize", () => {
+    const panel = document.getElementById("startPanel");
+    if (!panel) return;
+    // 上と同じ処理をもう一回走らせる（軽いのでOK）
+    const vv = window.visualViewport;
+    const W = vv ? vv.width  : window.innerWidth;
+    const H = vv ? vv.height : window.innerHeight;
+    const top = vv ? vv.offsetTop  : 0;
+    const left= vv ? vv.offsetLeft : 0;
+    overlay.style.left = left + "px";
+    overlay.style.top  = top  + "px";
+    overlay.style.width  = W + "px";
+    overlay.style.height = H + "px";
+  }, { passive: true });
+
+})();
+
+// ★モーダルは先に作っておく
+ensureRankModal();
+
+// ★「START箱の右上」に RANKボタン
+(function ensureRankButtonOnPanel() {
+  if (document.getElementById("rankOpenBtn")) return;
+  const panel = document.getElementById("startPanel");
+  if (!panel) return;
+
+  const b = document.createElement("button");
+  b.id = "rankOpenBtn";
+  b.textContent = "RANK";
+  b.style.position = "absolute";
+  b.style.top = "14px";
+  b.style.right = "14px";
+  b.style.padding = "8px 10px";
+  b.style.borderRadius = "12px";
+  b.style.border = "1px solid rgba(255,255,255,0.18)";
+  b.style.background = "rgba(255,255,255,0.10)";
+  b.style.color = "rgba(255,255,255,0.95)";
+  b.style.fontWeight = "900";
+  b.style.letterSpacing = "0.06em";
+  b.style.cursor = "pointer";
+  b.style.zIndex = "10";
+
+  b.onclick = () => {
+    const mode = (btn.textContent === "RETRY") ? "submit" : "view";
+    openRankModal(mode);
+  };
+
+  panel.appendChild(b);
+})();
+
