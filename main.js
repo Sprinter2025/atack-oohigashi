@@ -19,6 +19,11 @@
 //   - RESULT画面は「結果BOX」+「ランキングBOX」の2箱縦並び
 //   - 1ゲーム1回だけ送信（多重送信防止）
 //   - ランキングBOXはスクロール、RETRYは常に押せる
+// - Finish hold:
+//   - タイムアップ直後に FINISH!! を表示して 2秒待ってから結果画面へ（誤タップ防止）
+// - RESULT scroll fix:
+//   - RESULTでは overlay/startPanel を上寄せ + 縦スクロール可能にする（画面外も操作OK）
+//   - canvas がスクロール操作を奪わないよう touchAction を設定
 
 window.addEventListener("error", (e) => {
   alert("JS ERROR: " + (e?.message || e));
@@ -26,7 +31,6 @@ window.addEventListener("error", (e) => {
 window.addEventListener("unhandledrejection", (e) => {
   alert("PROMISE ERROR: " + (e?.reason?.message || e?.reason || e));
 });
-
 
 const canvas = document.getElementById("game");
 const ctx = canvas.getContext("2d", { alpha: false });
@@ -84,7 +88,6 @@ function createRankBox(kind /* "inline" | "modal" */) {
   box.style.boxSizing = "border-box";
   box.style.color = "rgba(255,255,255,0.95)";
 
-
   const title = document.createElement("div");
   title.textContent = "RANKING";
   title.style.fontWeight = "900";
@@ -92,7 +95,6 @@ function createRankBox(kind /* "inline" | "modal" */) {
   title.style.textAlign = "center";
   title.style.marginBottom = "8px";
   title.style.color = "rgba(255,255,255,0.95)";
-
   box.appendChild(title);
 
   const row = document.createElement("div");
@@ -117,6 +119,22 @@ function createRankBox(kind /* "inline" | "modal" */) {
   input.style.outline = "none";
   input.style.minWidth = "0"; // grid内で潰れても重なりにくくする
   row.appendChild(input);
+
+  // ★ iOSでキーボード表示時に画面が暴れるのを抑える
+  input.addEventListener("focus", () => {
+    lockOverlayToVisualViewport();
+  }, { passive: true });
+
+  input.addEventListener("blur", () => {
+    lockOverlayToVisualViewport();
+  }, { passive: true });
+
+  // ★ズーム抑制＆入力補助OFF（地味に効く）
+  input.style.fontSize = "16px";
+  input.inputMode = "text";
+  input.autocapitalize = "none";
+  input.autocorrect = "off";
+  input.spellcheck = false;
 
   const send = document.createElement("button");
   send.className = "rankSend";
@@ -162,6 +180,7 @@ function createRankBox(kind /* "inline" | "modal" */) {
   list.style.overflowY = "auto";
   list.style.overflowX = "hidden";
   list.style.webkitOverflowScrolling = "touch";
+  list.style.touchAction = "pan-y";
 
   box.appendChild(list);
 
@@ -226,7 +245,6 @@ async function refreshRankingOnBox(box, limit = 20) {
           <div style="font-weight:800;">${i + 1}. ${name}</div>
           <div style="font-weight:900;">${score}</div>
         </div>`;
-
       }).join("");
     }
 
@@ -380,6 +398,19 @@ function getViewportSize() {
   return { w, h };
 }
 
+// --- keyboard / visualViewport fix (iOS Safari) ---
+function lockOverlayToVisualViewport() {
+  const vv = window.visualViewport;
+  if (!vv) return;
+
+  overlay.style.position = "fixed";
+  overlay.style.left = vv.offsetLeft + "px";
+  overlay.style.top = vv.offsetTop + "px";
+  overlay.style.width = vv.width + "px";
+  overlay.style.height = vv.height + "px";
+}
+
+
 function fitCanvas() {
   const { w, h } = getViewportSize();
   const dpr = Math.min(2, Math.max(1, window.devicePixelRatio || 1));
@@ -391,7 +422,19 @@ function fitCanvas() {
 }
 window.addEventListener("resize", fitCanvas, { passive: true });
 window.visualViewport?.addEventListener("resize", fitCanvas, { passive: true });
+
+window.visualViewport?.addEventListener("resize", () => {
+  // キーボード表示/非表示でviewportが変わるのでoverlayも追従
+  lockOverlayToVisualViewport();
+}, { passive: true });
+
+window.visualViewport?.addEventListener("scroll", () => {
+  // iOS SafariでoffsetTopが変わることがあるので追従
+  lockOverlayToVisualViewport();
+}, { passive: true });
+
 fitCanvas();
+lockOverlayToVisualViewport();
 
 // ---- particle sprite (fast) ----
 let dotSprite = null;
@@ -503,7 +546,7 @@ assets.faceHit.src = "./assets/face_hit.png";
 let audioCtx = null;
 let gainBgm = null;
 let gainSe = null;
-let buffers = { hit01: null, hit02: null, count: null, bgm: null };
+let buffers = { hit01: null, hit02: null, count: null, finish: null, bgm: null };
 let bgmSource = null;
 
 let audioReadyPromise = null;
@@ -520,7 +563,7 @@ function setButtonLoading(on) {
 }
 
 function audioIsReady() {
-  return !!(audioCtx && buffers.hit01 && buffers.hit02 && buffers.count && buffers.bgm);
+  return !!(audioCtx && buffers.hit01 && buffers.hit02 && buffers.count && buffers.finish && buffers.bgm);
 }
 
 async function ensureAudio() {
@@ -550,17 +593,19 @@ async function ensureAudio() {
         }
       }
 
-      const [b1, b2, b3, b4] = await Promise.all([
+      const [b1, b2, b3, b4, b5] = await Promise.all([
         loadBuf("./assets/hit01.mp3"),
         loadBuf("./assets/hit02.mp3"),
         loadBuf("./assets/count.mp3"),
         loadBuf("./assets/bgm.mp3"),
+        loadBuf("./assets/finish.mp3"),
       ]);
 
       buffers.hit01 = b1;
       buffers.hit02 = b2;
       buffers.count = b3;
       buffers.bgm = b4;
+      buffers.finish = b5;
 
     } catch (e) {
       audioReadyPromise = null;
@@ -568,7 +613,7 @@ async function ensureAudio() {
       audioCtx = null;
       gainBgm = null;
       gainSe = null;
-      buffers = { hit01: null, hit02: null, count: null, bgm: null };
+      buffers = { hit01: null, hit02: null, count: null, finish: null, bgm: null }; // ★FIX
       bgmSource = null;
       throw e;
     }
@@ -609,6 +654,7 @@ function playSE(buf, volMul = 1.0) {
 function playHitNormal() { playSE(buffers.hit01, 0.95); }
 function playHitBonus()  { playSE(buffers.hit02, 1.00); }
 function playCount()     { playSE(buffers.count, 0.95); }
+function playFinish()    { playSE(buffers.finish, 1.00); }
 
 // ---- result packs (from result_data.js) ----
 function pickResultPack(score) {
@@ -755,6 +801,10 @@ const state = {
   countPlayed: false,
   goHold: 0,
 
+  // --- finish hold ---
+  finishHold: 0,
+  finishTextTimer: 0,
+
   score: 0,
   timeLeft: GAME_SECONDS,
 
@@ -853,6 +903,10 @@ function resetGameForIntro(introSeconds) {
   state.countPlayed = false;
   state.goHold = 0;
 
+  // finish reset
+  state.finishHold = 0;
+  state.finishTextTimer = 0;
+
   state.score = 0;
   state.timeLeft = GAME_SECONDS;
 
@@ -873,6 +927,10 @@ function resetGameForIntro(introSeconds) {
   state.rankSubmitted = false;
   state.rankSubmitting = false;
 
+  // ★STARTでは中央寄せ＆スクロール無効に戻す（RESULTスクロール対策の復帰）
+  overlay.style.justifyContent = "center";
+  overlay.style.overflowY = "hidden";
+
   const { w, h } = getViewportSize();
 
   state.face.r = Math.min(w, h) * 0.10;
@@ -890,6 +948,9 @@ function resetGameForIntro(introSeconds) {
   state.face.vy = 0;
   state.face.hitTimer = 0;
   state.face.scalePop = 0;
+
+  // START/プレイ中は右上RANKボタンを表示
+  setRankCornerButtonVisible(true);
 
   elScore.textContent = "0";
   elTime.textContent = GAME_SECONDS.toFixed(1);
@@ -929,6 +990,13 @@ function pointInFace(px, py) {
 function endGame() {
   overlay.style.display = "flex"; // overlay を flex運用してるので
 
+  // ★ RESULTでは上寄せにしてスクロールできるようにする（重要）
+  overlay.style.justifyContent = "flex-start";
+  overlay.style.alignItems = "center";
+  overlay.style.overflowY = "auto";
+  overlay.style.webkitOverflowScrolling = "touch";
+  overlay.style.touchAction = "pan-y";
+
   state.running = false;
   overlay.classList.remove("hidden");
 
@@ -940,6 +1008,10 @@ function endGame() {
   } else {
     titleEl.textContent = "RESULT";
   }
+
+  // RESULTでは右上RANKボタンを消す（下にランキングがあるため）
+  setRankCornerButtonVisible(false);
+
 
   // RESULT画面：2箱縦並び（結果BOX + ランキングBOX）
   resultEl.textContent = "";
@@ -1180,11 +1252,42 @@ function update(dt) {
     return;
   }
 
+  // ---- FINISH hold (2s) ----
+  if (state.phase === "finish") {
+    state.finishHold = Math.max(0, state.finishHold - dt);
+    state.finishTextTimer = Math.max(0, state.finishTextTimer - dt);
+
+    // 演出中は軽い更新だけ（誤タップ防止）
+    updateParticles(dt);
+    updateFloaters(dt);
+
+    if (state.finishHold <= 0) {
+      endGame();
+    }
+    return;
+  }
+
   state.timeLeft -= dt;
   if (state.timeLeft <= 0) {
     state.timeLeft = 0;
     elTime.textContent = "0.0";
-    endGame();
+
+    // 2秒待ってから結果へ（誤タップ防止）
+    state.phase = "finish";
+    state.finishHold = 2.0;
+    state.finishTextTimer = 1.2;
+    state.shake = Math.max(state.shake, IS_MOBILE ? 0.18 : 0.22);
+
+    playFinish(); // FINISH専用SE
+    const { w, h } = getViewportSize();
+    addFloater("FINISH!!", w / 2, h / 2, {
+      size: IS_MOBILE ? 56 : 72,
+      life: 1.2,
+      rise: 0,
+      wobble: 0,
+      weight: 1000
+    });
+
     return;
   }
   elTime.textContent = state.timeLeft.toFixed(1);
@@ -1439,11 +1542,11 @@ function loop(t) {
   }
 }
 
-
 // ★overlay を必ず最前面に出す（START画面が消える主因＝z-index負け対策）
 canvas.style.position = "fixed";
 canvas.style.inset = "0";
 canvas.style.zIndex = "1";
+canvas.style.touchAction = "none"; // ★重要：スクロール操作をcanvasが奪わない
 
 overlay.style.position = "fixed";
 overlay.style.inset = "0";
@@ -1460,6 +1563,7 @@ btn.textContent = "START";
 canvas.style.position = "fixed";
 canvas.style.inset = "0";
 canvas.style.zIndex = "1";
+canvas.style.touchAction = "none";
 
 overlay.style.position = "fixed";
 overlay.style.inset = "0";
@@ -1492,6 +1596,12 @@ overlay.style.boxSizing = "border-box";
     panel.style.justifyItems = "center";
     panel.style.position = "relative"; // ← RANKボタンを箱の右上に置く
     panel.style.color = "rgba(255,255,255,0.95)";
+
+    // ★ panel自体をスクロール可能にする（RESULTで中身がはみ出してもOK）
+    panel.style.maxHeight = "min(86vh, 760px)";
+    panel.style.overflowY = "auto";
+    panel.style.webkitOverflowScrolling = "touch";
+    panel.style.touchAction = "pan-y";
 
     while (overlay.firstChild) overlay.removeChild(overlay.firstChild);
     // overlayを一旦空にして、panelを載せる
@@ -1608,3 +1718,8 @@ ensureRankModal();
   panel.appendChild(b);
 })();
 
+function setRankCornerButtonVisible(visible) {
+  const b = document.getElementById("rankOpenBtn");
+  if (!b) return;
+  b.style.display = visible ? "inline-block" : "none";
+}
