@@ -1,0 +1,974 @@
+// game_core.js (FULL COPY-PASTE)
+// - ゲーム本体（state, update/draw/loop, pointer, result UI）
+// - 依存: app_base.js, ui_layout.js, ranking.js, audio.js
+
+// ---- particle sprite ----
+let dotSprite = null;
+function makeDotSprite() {
+  const c = document.createElement("canvas");
+  c.width = 32;
+  c.height = 32;
+  const g = c.getContext("2d");
+
+  const cx = 16, cy = 16;
+  const grad = g.createRadialGradient(cx, cy, 0, cx, cy, 16);
+  grad.addColorStop(0.0, "rgba(255,255,255,1.0)");
+  grad.addColorStop(0.5, "rgba(255,255,255,0.65)");
+  grad.addColorStop(1.0, "rgba(255,255,255,0.0)");
+
+  g.fillStyle = grad;
+  g.beginPath();
+  g.arc(cx, cy, 16, 0, Math.PI * 2);
+  g.fill();
+
+  dotSprite = c;
+}
+makeDotSprite();
+
+// ---- Rainbow fallback (when ctx.filter doesn't work) ----
+const HAS_CTX_FILTER = ("filter" in ctx);
+const RAINBOW_STEP_DEG = 12;
+const rainbowCache = new Map();
+
+function rgbToHsl(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r,g,b), min = Math.min(r,g,b);
+  let h = 0, s = 0;
+  const l = (max + min) / 2;
+  const d = max - min;
+  if (d !== 0) {
+    s = d / (1 - Math.abs(2*l - 1));
+    switch (max) {
+      case r: h = ((g - b) / d) % 6; break;
+      case g: h = (b - r) / d + 2; break;
+      case b: h = (r - g) / d + 4; break;
+    }
+    h *= 60;
+    if (h < 0) h += 360;
+  }
+  return [h, s, l];
+}
+
+function hslToRgb(h, s, l) {
+  const c = (1 - Math.abs(2*l - 1)) * s;
+  const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+  const m = l - c/2;
+  let r1=0,g1=0,b1=0;
+  if (0<=h && h<60) [r1,g1,b1]=[c,x,0];
+  else if (60<=h && h<120) [r1,g1,b1]=[x,c,0];
+  else if (120<=h && h<180) [r1,g1,b1]=[0,c,x];
+  else if (180<=h && h<240) [r1,g1,b1]=[0,x,c];
+  else if (240<=h && h<300) [r1,g1,b1]=[x,0,c];
+  else [r1,g1,b1]=[c,0,x];
+  return [
+    Math.round((r1+m)*255),
+    Math.round((g1+m)*255),
+    Math.round((b1+m)*255)
+  ];
+}
+
+function getRainbowCanvas(img, hueDeg, sizePx) {
+  if (!img || !img.complete || sizePx <= 0) return null;
+
+  const qHue = (Math.floor(hueDeg / RAINBOW_STEP_DEG) * RAINBOW_STEP_DEG) % 360;
+  const key = `${img.src}|${qHue}|${sizePx}`;
+  const cached = rainbowCache.get(key);
+  if (cached) return cached;
+
+  const c = document.createElement("canvas");
+  c.width = sizePx;
+  c.height = sizePx;
+  const g = c.getContext("2d", { willReadFrequently: true });
+
+  g.clearRect(0, 0, sizePx, sizePx);
+  g.drawImage(img, 0, 0, sizePx, sizePx);
+
+  const im = g.getImageData(0, 0, sizePx, sizePx);
+  const d = im.data;
+  for (let i = 0; i < d.length; i += 4) {
+    const a = d[i+3];
+    if (a === 0) continue;
+    const [h, s, l] = rgbToHsl(d[i], d[i+1], d[i+2]);
+    const nh = (h + qHue) % 360;
+    const [rr, gg, bb] = hslToRgb(nh, s, l);
+    d[i] = rr; d[i+1] = gg; d[i+2] = bb;
+  }
+  g.putImageData(im, 0, 0);
+
+  if (rainbowCache.size > 80) rainbowCache.clear();
+  rainbowCache.set(key, c);
+  return c;
+}
+
+// ---- image assets ----
+const assets = {
+  face: new Image(),
+  faceHit: new Image(),
+};
+assets.face.src = "./assets/face.png";
+assets.faceHit.src = "./assets/face_hit.png";
+
+// ---- result packs (from result_data.js) ----
+function pickResultPack(score) {
+  const packs = window.RESULT_PACKS;
+  if (!Array.isArray(packs) || packs.length === 0) return null;
+
+  for (let i = 0; i < packs.length; i++) {
+    const p = packs[i];
+    const minOk = (score >= (p.min ?? -Infinity));
+    const maxOk = (p.max == null) ? true : (score <= p.max);
+    if (minOk && maxOk) return p;
+  }
+  return packs[packs.length - 1] || null;
+}
+
+const resultImgCache = new Map();
+
+async function preloadResultImages() {
+  const packs = window.RESULT_PACKS;
+  if (!Array.isArray(packs)) return;
+
+  const urls = new Set();
+  for (const p of packs) if (p && p.img) urls.add(p.img);
+
+  const tasks = [];
+  urls.forEach((url) => {
+    if (resultImgCache.has(url)) return;
+    const im = new Image();
+    im.src = url;
+    resultImgCache.set(url, im);
+
+    if (im.decode) tasks.push(im.decode().catch(() => {}));
+    else {
+      tasks.push(new Promise((r) => {
+        im.onload = () => r();
+        im.onerror = () => r();
+      }));
+    }
+  });
+
+  await Promise.all(tasks);
+}
+
+(function waitAndPreload() {
+  let tries = 0;
+  const timer = setInterval(() => {
+    tries++;
+    if (Array.isArray(window.RESULT_PACKS) || tries > 50) {
+      clearInterval(timer);
+      preloadResultImages().catch(() => {});
+    }
+  }, 100);
+})();
+
+function pickRandom(arr) {
+  if (!Array.isArray(arr) || arr.length === 0) return "";
+  return arr[(Math.random() * arr.length) | 0];
+}
+
+function renderResultWithPack(score) {
+  const pack = pickResultPack(score);
+
+  const wrap = document.createElement("div");
+  wrap.style.display = "grid";
+  wrap.style.gap = "10px";
+  wrap.style.justifyItems = "center";
+
+  const needsImg = !!(pack && pack.img);
+  if (needsImg) wrap.style.visibility = "hidden";
+
+  if (pack && pack.img) {
+    const img = document.createElement("img");
+    const cached = resultImgCache.get(pack.img);
+    img.src = cached ? cached.src : pack.img;
+
+    img.alt = "result";
+    img.style.width = "min(72vw, 360px)";
+    img.style.height = "auto";
+    img.style.borderRadius = "14px";
+    img.style.boxShadow = "0 10px 30px rgba(0,0,0,0.35)";
+    img.loading = "eager";
+    img.decoding = "sync";
+
+    const show = () => { wrap.style.visibility = "visible"; };
+    if (img.complete) show();
+    else {
+      img.addEventListener("load", show, { once: true });
+      img.addEventListener("error", show, { once: true });
+    }
+
+    wrap.appendChild(img);
+  } else {
+    wrap.style.visibility = "visible";
+  }
+
+  const comment = document.createElement("div");
+  comment.textContent = pack ? pickRandom(pack.comments) : "";
+  comment.style.fontWeight = "800";
+  comment.style.fontSize = "18px";
+  comment.style.textAlign = "center";
+  comment.style.lineHeight = "1.3";
+  wrap.appendChild(comment);
+
+  const scoreLine = document.createElement("div");
+  scoreLine.textContent = `Score: ${score} / Best: ${best}`;
+  scoreLine.style.opacity = "0.95";
+  scoreLine.style.fontWeight = "700";
+  wrap.appendChild(scoreLine);
+
+  return wrap;
+}
+
+// ---- best ----
+let best = Number(localStorage.getItem(BEST_KEY) || 0);
+elBest.textContent = best.toString();
+
+// ---- timing ----
+const INTRO_FIRST_SECONDS = 7.0;
+const INTRO_RETRY_SECONDS = 3.0;
+const GO_HOLD_SECONDS = 1.0;
+const GAME_SECONDS = 30.0;
+
+// ---- combo/fever spec ----
+const COMBO_BONUS_EVERY = 10;
+const COMBO_BONUS_PTS = 5;
+const FEVER_EVERY = 50;
+const FEVER_SECONDS = 7.0;
+
+function speedLimit() {
+  const { w, h } = getViewportSize();
+  const s = Math.min(w, h);
+  const base = clamp(s * 0.85, 520, 900);
+  return IS_MOBILE ? base * 0.625 : base;
+}
+
+const state = {
+  running: false,
+  lastT: 0,
+
+  phase: "intro",
+  introLeft: INTRO_FIRST_SECONDS,
+  introTotal: INTRO_FIRST_SECONDS,
+  countPlayed: false,
+  goHold: 0,
+
+  finishHold: 0,
+  finishTextTimer: 0,
+
+  score: 0,
+  timeLeft: GAME_SECONDS,
+
+  particles: [],
+  floaters: [],
+
+  shake: 0,
+
+  combo: 0,
+  comboTimer: 0,
+  comboWindow: 1.0,
+  fever: false,
+  feverTimer: 0,
+  scoreMul: 1,
+
+  feverFlash: 0,
+  feverBurst: 0,
+  hueTime: 0,
+
+  rankSubmitted: false,
+  rankSubmitting: false,
+
+  face: {
+    x: 120,
+    y: 220,
+    r: 64,
+    vx: 0,
+    vy: 0,
+    baseVx: 0,
+    baseVy: 0,
+    hitTimer: 0,
+    scalePop: 0,
+  }
+};
+
+let hasStartedOnce = false;
+
+// ---- floaters ----
+const MAX_FLOATERS = IS_MOBILE ? 18 : 60;
+
+function addFloater(text, x, y, opts = {}) {
+  const {
+    size = 26,
+    life = IS_MOBILE ? 0.55 : 0.7,
+    rise = IS_MOBILE ? 110 : 140,
+    wobble = IS_MOBILE ? 8 : 10,
+    weight = 900,
+  } = opts;
+
+  if (state.floaters.length >= MAX_FLOATERS) return;
+
+  state.floaters.push({
+    text,
+    x0: x,
+    y0: y,
+    t: 0,
+    life,
+    rise,
+    wobble,
+    size,
+    weight,
+  });
+}
+
+function startFever(seconds = FEVER_SECONDS) {
+  state.fever = true;
+  state.feverTimer = seconds;
+  state.scoreMul = 2;
+
+  state.feverFlash = 0.18;
+  state.feverBurst = 1.0;
+
+  playHitBonus();
+
+  addFloater("FEVER x2!!", state.face.x, state.face.y - state.face.r - 12, {
+    size: IS_MOBILE ? 34 : 40,
+    life: 1.0,
+    rise: IS_MOBILE ? 70 : 90,
+    wobble: 20,
+    weight: 1000
+  });
+
+  state.shake = Math.max(state.shake, IS_MOBILE ? 0.22 : 0.28);
+}
+
+function stopFever() {
+  state.fever = false;
+  state.feverTimer = 0;
+  state.scoreMul = 1;
+}
+
+function resetGameForIntro(introSeconds) {
+  state.phase = "intro";
+  state.introTotal = introSeconds;
+  state.introLeft = introSeconds;
+  state.countPlayed = false;
+  state.goHold = 0;
+
+  state.finishHold = 0;
+  state.finishTextTimer = 0;
+
+  state.score = 0;
+  state.timeLeft = GAME_SECONDS;
+
+  state.particles.length = 0;
+  state.floaters.length = 0;
+
+  state.shake = 0;
+
+  state.combo = 0;
+  state.comboTimer = 0;
+  stopFever();
+
+  state.feverFlash = 0;
+  state.feverBurst = 0;
+  state.hueTime = 0;
+
+  state.rankSubmitted = false;
+  state.rankSubmitting = false;
+
+  overlay.style.justifyContent = "center";
+  overlay.style.overflowY = "hidden";
+
+  const { w, h } = getViewportSize();
+
+  state.face.r = Math.min(w, h) * 0.10;
+  state.face.x = rand(state.face.r, w - state.face.r);
+  state.face.y = rand(state.face.r + 90, h - state.face.r);
+
+  const spMul = IS_MOBILE ? 0.625 : 1.0;
+
+  const baseVx = rand(220, 340) * spMul * (Math.random() < 0.5 ? -1 : 1);
+  const baseVy = rand(180, 300) * spMul * (Math.random() < 0.5 ? -1 : 1);
+  state.face.baseVx = baseVx;
+  state.face.baseVy = baseVy;
+
+  state.face.vx = 0;
+  state.face.vy = 0;
+  state.face.hitTimer = 0;
+  state.face.scalePop = 0;
+
+  setRankCornerButtonVisible(true);
+
+  elScore.textContent = "0";
+  elTime.textContent = GAME_SECONDS.toFixed(1);
+}
+
+// ---- particles ----
+const MAX_PARTICLES = IS_MOBILE ? 60 : 220;
+
+function spawnParticles(x, y, n = 18) {
+  if (state.particles.length >= MAX_PARTICLES) return;
+
+  const nn = IS_MOBILE ? Math.max(4, Math.floor(n * 0.35)) : n;
+
+  for (let i = 0; i < nn; i++) {
+    if (state.particles.length >= MAX_PARTICLES) break;
+
+    const a = rand(0, Math.PI * 2);
+    const sp = rand(140, 620) * (IS_MOBILE ? 0.8 : 1.0);
+    state.particles.push({
+      x, y,
+      vx: Math.cos(a) * sp,
+      vy: Math.sin(a) * sp,
+      life: rand(0.18, 0.42),
+      t: 0
+    });
+  }
+}
+
+function pointInFace(px, py) {
+  const dx = px - state.face.x;
+  const dy = py - state.face.y;
+  const pad = IS_MOBILE ? 1.40 : 1.15;
+  const rr = state.face.r * pad;
+  return (dx * dx + dy * dy) <= (rr * rr);
+}
+
+function endGame() {
+  overlay.style.display = "flex";
+
+  overlay.style.justifyContent = "flex-start";
+  overlay.style.alignItems = "center";
+  overlay.style.overflowY = "auto";
+  overlay.style.webkitOverflowScrolling = "touch";
+  overlay.style.touchAction = "pan-y";
+
+  state.running = false;
+  overlay.classList.remove("hidden");
+
+  if (state.score > best) {
+    best = state.score;
+    localStorage.setItem(BEST_KEY, String(best));
+    elBest.textContent = String(best);
+    titleEl.textContent = "NEW BEST!";
+  } else {
+    titleEl.textContent = "RESULT";
+  }
+
+  setRankCornerButtonVisible(false);
+
+  resultEl.textContent = "";
+  resultEl.style.display = "grid";
+  resultEl.style.gap = "12px";
+  resultEl.style.justifyItems = "center";
+  resultEl.style.width = "min(86vw, 420px)";
+  resultEl.style.boxSizing = "border-box";
+
+  const resultWrap = renderResultWithPack(state.score);
+  resultWrap.style.width = "100%";
+  resultWrap.style.padding = "10px 12px";
+  resultWrap.style.borderRadius = "14px";
+  resultWrap.style.background = "rgba(255,255,255,0.08)";
+  resultWrap.style.boxShadow = "0 10px 28px rgba(0,0,0,0.25)";
+  resultWrap.style.backdropFilter = "blur(6px)";
+  resultWrap.style.boxSizing = "border-box";
+  resultEl.appendChild(resultWrap);
+
+  const box = ensureRankInlineBox(resultEl);
+  setRankingModeOnBox(box, "submit");
+
+  const { send } = getRankEls(box);
+  if (send) send.onclick = () => submitMyScoreOnBox(box, state.score);
+
+  refreshRankingOnBox(box, RANK_LIMIT);
+
+  btn.textContent = "RETRY";
+  btn.style.position = "relative";
+  btn.style.zIndex = "10";
+}
+
+async function startGame() {
+  if (isStarting) return;
+  isStarting = true;
+  setButtonLoading(true);
+
+  try {
+    await ensureAudio();
+    if (audioCtx && audioCtx.state === "suspended") {
+      try { await audioCtx.resume(); } catch (_) {}
+    }
+    startBGM();
+
+    const introSeconds = hasStartedOnce ? INTRO_RETRY_SECONDS : INTRO_FIRST_SECONDS;
+    resetGameForIntro(introSeconds);
+
+    state.running = true;
+    overlay.classList.add("hidden");
+    overlay.style.display = "none";
+    state.lastT = performance.now();
+
+    addFloater("GET READY...", state.face.x, state.face.y - state.face.r - 10, {
+      size: IS_MOBILE ? 30 : 34,
+      life: 1.0,
+      rise: 50,
+      wobble: 8,
+      weight: 900
+    });
+
+    hasStartedOnce = true;
+    requestAnimationFrame(loop);
+
+  } catch (e) {
+    console.error(e);
+    overlay.classList.remove("hidden");
+    titleEl.textContent = "AUDIO ERROR";
+    resultEl.textContent = String(e?.message || "音声の読み込みに失敗（assetsパス/サーバ起動を確認）");
+    btn.textContent = "RETRY";
+  } finally {
+    setButtonLoading(false);
+    isStarting = false;
+  }
+}
+
+btn.addEventListener("click", startGame);
+
+// ---- pointer ----
+function getPointerPos(e) {
+  const rect = canvas.getBoundingClientRect();
+  const x = (e.clientX - rect.left);
+  const y = (e.clientY - rect.top);
+  return { x, y };
+}
+
+function particleCountForHit() {
+  let n = 18;
+  n = clamp(18 + state.combo * 0.6, 18, 34);
+  if (state.fever) n = Math.floor(n * 1.6);
+  if (state.combo > 0 && (state.combo % COMBO_BONUS_EVERY === 0)) n += 10;
+  return n;
+}
+
+canvas.addEventListener("pointerdown", (e) => {
+  if (!state.running) return;
+  if (state.phase !== "play") return;
+
+  const { x, y } = getPointerPos(e);
+
+  if (pointInFace(x, y)) {
+    if (state.comboTimer > 0) state.combo += 1;
+    else state.combo = 1;
+    state.comboTimer = state.comboWindow;
+
+    const add = 1 * state.scoreMul;
+    state.score += add;
+
+    addFloater(`+${add}`, state.face.x, state.face.y - state.face.r * 0.15, {
+      size: IS_MOBILE ? 24 : 28, life: 0.60, rise: 120, wobble: 8, weight: 900
+    });
+
+    playHitNormal();
+
+    if (state.combo % COMBO_BONUS_EVERY === 0) {
+      const bonus = COMBO_BONUS_PTS * state.scoreMul;
+      state.score += bonus;
+
+      addFloater(`+${bonus} BONUS!!`, state.face.x, state.face.y, {
+        size: IS_MOBILE ? 34 : 44, life: 0.95, rise: 150, wobble: 18, weight: 1000
+      });
+
+      playHitBonus();
+      state.shake = Math.max(state.shake, IS_MOBILE ? 0.26 : 0.33);
+    }
+
+    if (state.combo % FEVER_EVERY === 0) startFever(FEVER_SECONDS);
+
+    elScore.textContent = String(state.score);
+
+    state.face.hitTimer = 0.18;
+    state.face.scalePop = 0.20;
+
+    state.shake = Math.max(
+      state.shake,
+      (state.fever ? (IS_MOBILE ? 0.16 : 0.20) : (IS_MOBILE ? 0.13 : 0.16)) + Math.min(0.22, state.combo * 0.012)
+    );
+
+    spawnParticles(state.face.x, state.face.y, particleCountForHit());
+
+    const mult = rand(0.97, 1.05);
+    state.face.vx *= mult;
+    state.face.vy *= mult;
+
+    const vmax = speedLimit();
+    state.face.vx = clamp(state.face.vx, -vmax, vmax);
+    state.face.vy = clamp(state.face.vy, -vmax, vmax);
+
+  } else {
+    state.comboTimer = 0;
+    state.combo = 0;
+    state.timeLeft = Math.max(0, state.timeLeft - 0.25);
+  }
+}, { passive: true });
+
+// ---- update helpers ----
+function updateParticles(dt) {
+  const arr = state.particles;
+  let w = 0;
+  for (let i = 0; i < arr.length; i++) {
+    const p = arr[i];
+    p.t += dt;
+    if (p.t >= p.life) continue;
+
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    const damp = Math.pow(0.06, dt);
+    p.vx *= damp;
+    p.vy *= damp;
+
+    arr[w++] = p;
+  }
+  arr.length = w;
+}
+
+function updateFloaters(dt) {
+  const arr = state.floaters;
+  let w = 0;
+  for (let i = 0; i < arr.length; i++) {
+    const ft = arr[i];
+    ft.t += dt;
+    if (ft.t >= ft.life) continue;
+    arr[w++] = ft;
+  }
+  arr.length = w;
+}
+
+function update(dt) {
+  state.hueTime += dt;
+
+  if (state.feverFlash > 0) state.feverFlash = Math.max(0, state.feverFlash - dt);
+  if (state.feverBurst > 0) state.feverBurst = Math.max(0, state.feverBurst - dt * 2.6);
+
+  if (state.phase === "intro") {
+    if (state.goHold > 0) {
+      state.goHold = Math.max(0, state.goHold - dt);
+      elTime.textContent = GAME_SECONDS.toFixed(1);
+
+      updateFloaters(dt);
+      updateParticles(dt);
+
+      if (state.goHold <= 0) {
+        state.phase = "play";
+        state.timeLeft = GAME_SECONDS;
+        elTime.textContent = state.timeLeft.toFixed(1);
+        state.face.vx = state.face.baseVx;
+        state.face.vy = state.face.baseVy;
+      }
+      return;
+    }
+
+    state.introLeft = Math.max(0, Math.min(state.introTotal, state.introLeft - dt));
+    elTime.textContent = GAME_SECONDS.toFixed(1);
+
+    if (!state.countPlayed && state.introLeft <= 3.0) {
+      playCount();
+      state.countPlayed = true;
+    }
+
+    updateFloaters(dt);
+    updateParticles(dt);
+
+    if (state.introLeft <= 0) {
+      state.goHold = GO_HOLD_SECONDS;
+      elTime.textContent = GAME_SECONDS.toFixed(1);
+
+      addFloater("GO!!", state.face.x, state.face.y - state.face.r - 10, {
+        size: IS_MOBILE ? 46 : 52, life: GO_HOLD_SECONDS, rise: 140, wobble: 16, weight: 1000
+      });
+
+      state.shake = Math.max(state.shake, IS_MOBILE ? 0.18 : 0.22);
+    }
+    return;
+  }
+
+  if (state.phase === "finish") {
+    state.finishHold = Math.max(0, state.finishHold - dt);
+    state.finishTextTimer = Math.max(0, state.finishTextTimer - dt);
+
+    updateParticles(dt);
+    updateFloaters(dt);
+
+    if (state.finishHold <= 0) endGame();
+    return;
+  }
+
+  state.timeLeft -= dt;
+  if (state.timeLeft <= 0) {
+    state.timeLeft = 0;
+    elTime.textContent = "0.0";
+
+    state.phase = "finish";
+    state.finishHold = 2.0;
+    state.finishTextTimer = 1.2;
+    state.shake = Math.max(state.shake, IS_MOBILE ? 0.18 : 0.22);
+
+    playFinish();
+    const { w, h } = getViewportSize();
+    addFloater("FINISH!!", w / 2, h / 2, {
+      size: IS_MOBILE ? 56 : 72,
+      life: 1.2,
+      rise: 0,
+      wobble: 0,
+      weight: 1000
+    });
+
+    return;
+  }
+  elTime.textContent = state.timeLeft.toFixed(1);
+
+  const f = state.face;
+  f.x += f.vx * dt;
+  f.y += f.vy * dt;
+
+  const { w, h } = getViewportSize();
+  const topMargin = 56;
+
+  if (f.x - f.r < 0) { f.x = f.r; f.vx *= -1; }
+  if (f.x + f.r > w) { f.x = w - f.r; f.vx *= -1; }
+  if (f.y - f.r < topMargin) { f.y = topMargin + f.r; f.vy *= -1; }
+  if (f.y + f.r > h) { f.y = h - f.r; f.vy *= -1; }
+
+  f.hitTimer = Math.max(0, f.hitTimer - dt);
+  f.scalePop = Math.max(0, f.scalePop - dt);
+  state.shake = Math.max(0, state.shake - dt);
+
+  updateParticles(dt);
+  updateFloaters(dt);
+
+  if (state.comboTimer > 0) {
+    state.comboTimer = Math.max(0, state.comboTimer - dt);
+    if (state.comboTimer === 0) state.combo = 0;
+  }
+
+  if (state.fever) {
+    state.feverTimer -= dt;
+    if (state.feverTimer <= 0) stopFever();
+  }
+}
+
+// ---- intro countdown drawing ----
+function drawIntroCountdown() {
+  const { w, h } = getViewportSize();
+  const left = state.introLeft;
+
+  const waiting = (left > 5.0);
+  const n = Math.max(0, Math.min(5, Math.ceil(left)));
+  const isGo = (left <= 0.0);
+
+  const p = (state.introTotal > 0) ? (left / state.introTotal) : 0;
+  const pulse = 1 + 0.08 * Math.sin((1 - p) * Math.PI * 6);
+
+  ctx.save();
+  ctx.globalAlpha = 0.95;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+
+  ctx.font = `900 24px system-ui, sans-serif`;
+  ctx.fillStyle = "rgba(0,0,0,0.55)";
+  ctx.fillText("GET READY", w / 2 + 2, h / 2 - 110 + 2);
+  ctx.fillStyle = "rgba(255,255,255,0.98)";
+  ctx.fillText("GET READY", w / 2, h / 2 - 110);
+
+  if (waiting) { ctx.restore(); return; }
+
+  const text = isGo ? "GO!" : String(n);
+
+  ctx.font = `${Math.floor((IS_MOBILE ? 100 : 120) * pulse)}px system-ui, sans-serif`;
+  ctx.fillStyle = "rgba(0,0,0,0.55)";
+  ctx.fillText(text, w / 2 + 3, h / 2 + 3);
+  ctx.fillStyle = "rgba(255,255,255,0.98)";
+  ctx.fillText(text, w / 2, h / 2);
+
+  ctx.restore();
+}
+
+// ---- draw ----
+const BG_COLOR = "#0b0f1a";
+const HUD_COLOR = "rgba(255,255,255,0.96)";
+
+function draw() {
+  const { w, h } = getViewportSize();
+
+  let ox = 0, oy = 0;
+  if (state.shake > 0) {
+    const base = state.fever ? 14 : 10;
+    const s = state.shake * base;
+    ox = rand(-s, s);
+    oy = rand(-s, s);
+  }
+
+  ctx.save();
+  ctx.translate(ox, oy);
+
+  ctx.clearRect(-20, -20, w + 40, h + 40);
+  ctx.fillStyle = BG_COLOR;
+  ctx.fillRect(0, 0, w, h);
+
+  if (state.fever) {
+    const pulse = 0.06 + 0.03 * Math.sin(state.hueTime * 6.0);
+    ctx.globalAlpha = pulse;
+    ctx.fillStyle = "rgba(180,220,255,1)";
+    ctx.fillRect(0, 0, w, h);
+    ctx.globalAlpha = 1;
+  }
+
+  if (dotSprite) {
+    for (let i = 0; i < state.particles.length; i++) {
+      const p = state.particles[i];
+      const a = 1 - (p.t / p.life);
+      ctx.globalAlpha = a;
+      const r = (IS_MOBILE ? 8 : 10) * a + 2;
+      ctx.drawImage(dotSprite, p.x - r, p.y - r, r * 2, r * 2);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  for (let i = 0; i < state.floaters.length; i++) {
+    const ft = state.floaters[i];
+    const pp = ft.t / ft.life;
+    const ease = 1 - Math.pow(1 - pp, 3);
+    const yy = ft.y0 - ft.rise * ease;
+    const xx = ft.x0 + Math.sin(pp * Math.PI * 2) * ft.wobble;
+    const alpha = 1 - pp;
+
+    ctx.globalAlpha = alpha;
+    ctx.font = `${ft.weight} ${ft.size}px system-ui, sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+
+    ctx.fillStyle = "rgba(0,0,0,0.55)";
+    ctx.fillText(ft.text, xx + 2, yy + 2);
+
+    ctx.fillStyle = "rgba(255,255,255,0.98)";
+    ctx.fillText(ft.text, xx, yy);
+  }
+  ctx.globalAlpha = 1;
+
+  const f = state.face;
+  const img = (f.hitTimer > 0 ? assets.faceHit : assets.face);
+
+  const pop = (f.scalePop > 0) ? (1 + 0.18 * (f.scalePop / 0.20)) : 1;
+  const size = (f.r * 2) * pop;
+
+  ctx.globalAlpha = 0.32;
+  ctx.beginPath();
+  ctx.ellipse(f.x, f.y + f.r * 0.78, f.r * 0.95, f.r * 0.35, 0, 0, Math.PI * 2);
+  ctx.fillStyle = "rgba(255,255,255,0.35)";
+  ctx.fill();
+  ctx.globalAlpha = 1;
+
+  const hueDeg = (state.hueTime * 220 + (f.x + f.y) * 0.15) % 360;
+  const hueStrength = state.fever ? 1.0 : 0.0;
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(f.x, f.y, (f.r * pop), 0, Math.PI * 2);
+  ctx.clip();
+
+  const useRainbow = (hueStrength > 0);
+
+  if (useRainbow && HAS_CTX_FILTER) {
+    const sat = state.fever ? 2.2 : 1.2;
+    const con = state.fever ? 1.12 : 1.02;
+    ctx.filter = `hue-rotate(${hueDeg}deg) saturate(${sat}) contrast(${con})`;
+    ctx.drawImage(img, f.x - size / 2, f.y - size / 2, size, size);
+    ctx.filter = "none";
+  } else if (useRainbow && !HAS_CTX_FILTER) {
+    const sp = Math.max(32, (size | 0));
+    const rc = getRainbowCanvas(img, hueDeg, sp);
+    if (rc) ctx.drawImage(rc, f.x - size / 2, f.y - size / 2, size, size);
+    else ctx.drawImage(img, f.x - size / 2, f.y - size / 2, size, size);
+  } else {
+    ctx.drawImage(img, f.x - size / 2, f.y - size / 2, size, size);
+  }
+
+  ctx.filter = "none";
+  ctx.restore();
+
+  ctx.lineWidth = 4;
+  ctx.strokeStyle = "rgba(255,255,255,0.22)";
+  ctx.beginPath();
+  ctx.arc(f.x, f.y, (f.r * pop), 0, Math.PI * 2);
+  ctx.stroke();
+
+  if (state.phase === "intro") drawIntroCountdown();
+
+  if (state.feverFlash > 0 || state.feverBurst > 0) {
+    const aFlash = Math.min(1, state.feverFlash / 0.18);
+    if (aFlash > 0) {
+      ctx.save();
+      ctx.globalAlpha = 0.28 * aFlash;
+      ctx.fillStyle = "rgba(255,255,255,1)";
+      ctx.fillRect(0, 0, w, h);
+      ctx.restore();
+    }
+
+    const b = state.feverBurst;
+    if (b > 0) {
+      const cx = f.x, cy = f.y;
+      const r0 = f.r * 0.8;
+      const r1 = r0 + (1 - b) * (Math.min(w, h) * 0.55);
+
+      ctx.save();
+      ctx.globalAlpha = 0.55 * b;
+      ctx.lineWidth = 6;
+      ctx.strokeStyle = "rgba(255,255,255,0.9)";
+      ctx.beginPath();
+      ctx.arc(cx, cy, r1, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  ctx.restore();
+
+  // HUD
+  ctx.save();
+  ctx.globalAlpha = 0.95;
+  ctx.textAlign = "right";
+  ctx.textBaseline = "top";
+
+  const pad = 14;
+  const hudX = w - pad;
+  const hudY = 60;
+  const lineH = 28;
+
+  function drawHudText(text, x, y, font) {
+    ctx.font = font;
+    ctx.fillStyle = "rgba(0,0,0,0.55)";
+    ctx.fillText(text, x + 2, y + 2);
+    ctx.fillStyle = HUD_COLOR;
+    ctx.fillText(text, x, y);
+  }
+
+  if (state.phase === "play") {
+    if (state.combo >= 2) {
+      drawHudText(`COMBO: ${state.combo}`, hudX, hudY, `900 20px system-ui, sans-serif`);
+    }
+    if (state.fever) {
+      const tt = Math.max(0, state.feverTimer).toFixed(1);
+      drawHudText(`FEVER x2  ${tt}s`, hudX, hudY + lineH, `900 22px system-ui, sans-serif`);
+    }
+  }
+
+  ctx.restore();
+}
+
+function loop(t) {
+  if (!state.running) return;
+  const dt = clamp((t - state.lastT) / 1000, 0, 0.033);
+  state.lastT = t;
+
+  update(dt);
+  if (state.running) {
+    draw();
+    requestAnimationFrame(loop);
+  }
+}
